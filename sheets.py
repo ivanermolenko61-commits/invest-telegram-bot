@@ -1,4 +1,6 @@
 """Модуль для чтения данных из Google Sheets."""
+import json
+import os
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -11,41 +13,25 @@ SCOPES = [
 CREDENTIALS_FILE = "credentials.json"
 
 
-def parse_money(value):
-    """Парсит строку с числом в русском формате в float.
-
-    Примеры:
-        '5\\xa0244,00 ₽' → 5244.0
-        '1 234,56'       → 1234.56
-        '150.5'          → 150.5
-        ''               → 0.0
-        None             → 0.0
-    """
-    if value is None or value == "":
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    s = str(value).strip()
-    if not s:
-        return 0.0
-
-    # Убираем символы валют
-    for symbol in ("₽", "$", "€", "£"):
-        s = s.replace(symbol, "")
-    # Убираем все виды пробелов — обычный, неразрывный (\xa0), тонкий
-    s = s.replace(" ", "").replace("\xa0", "").replace("\u2009", "")
-    # Заменяем запятую на точку (русский формат → Python-формат)
-    s = s.replace(",", ".")
-
-    return float(s)
-
-
 def get_client():
-    """Создаёт авторизованный клиент Google Sheets."""
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+    """Создаёт авторизованный клиент Google Sheets.
+
+    Для локальной разработки читает файл credentials.json.
+    На хостинге — берёт JSON из переменной окружения GOOGLE_CREDENTIALS_JSON.
+    """
+    # 1. Пытаемся получить JSON из переменной окружения (для хостинга)
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    else:
+        # 2. Если переменной нет, читаем файл (для локального запуска)
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+
     return gspread.authorize(creds)
 
+
+# --- Остальные функции остаются без изменений ---
 
 def get_sheet_by_url(url, worksheet_name=None):
     """Открывает таблицу по URL и возвращает лист."""
@@ -88,7 +74,6 @@ def get_portfolio_summary(url, worksheet_name="Positions"):
             })
             total_value += value
 
-    # Сортируем по стоимости — самые крупные позиции сверху
     positions.sort(key=lambda p: p["value"], reverse=True)
 
     return {
@@ -97,3 +82,21 @@ def get_portfolio_summary(url, worksheet_name="Positions"):
         "money_value": round(money_value, 2),
         "count": len(positions),
     }
+
+
+def parse_money(value):
+    """Парсит строку с числом в русском формате в float."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip()
+    if not s:
+        return 0.0
+
+    for symbol in ("₽", "$", "€", "£"):
+        s = s.replace(symbol, "")
+    s = s.replace(" ", "").replace("\xa0", "").replace("\u2009", "")
+    s = s.replace(",", ".")
+    return float(s)
