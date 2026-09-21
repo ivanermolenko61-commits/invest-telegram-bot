@@ -9,11 +9,9 @@ TOKEN = os.getenv("TINKOFF_TOKEN")
 # ---------- Классификация акций ----------
 
 SECTOR_BY_TICKER = {
-    # Электроэнергетика
     "IRAO": "Электроэнергетика",
     "HYDR": "Электроэнергетика",
     "UPRO": "Электроэнергетика",
-    # Сырьевая
     "GMKN": "Сырьевая",
     "PLZL": "Сырьевая",
     "ALRS": "Сырьевая",
@@ -21,32 +19,25 @@ SECTOR_BY_TICKER = {
     "MAGN": "Сырьевая",
     "CHMF": "Сырьевая",
     "NLMK": "Сырьевая",
-    # Потребительские
     "X5":   "Потребительские",
     "MGNT": "Потребительские",
     "RAGR": "Потребительские",
-    # Финансовый
     "SBERP": "Финансовый",
     "SBER":  "Финансовый",
     "T":     "Финансовый",
     "VTBR":  "Финансовый",
     "MOEX":  "Финансовый",
-    # IT
     "YDEX": "IT",
     "ASTR": "IT",
     "HEAD": "IT",
-    "CIAN": "IT",
-    # Машиностроение и транспорт
+    "CNRU": "IT",      # ← было CIAN, стало CNRU
     "AFLT": "Машиностроение и транспорт",
     "FLOT": "Машиностроение и транспорт",
-    # Телекоммуникации
     "MTSS": "Телекоммуникации",
     "RTKM": "Телекоммуникации",
-    # Здравоохранение
     "PRMD": "Здравоохранение",
     "MDMG": "Здравоохранение",
     "OZPH": "Здравоохранение",
-    # Энергетика
     "SIBN": "Энергетика",
     "ROSN": "Энергетика",
     "GAZP": "Энергетика",
@@ -55,55 +46,45 @@ SECTOR_BY_TICKER = {
 }
 
 NAME_BY_TICKER = {
-    "IRAO": "Интер РАО",
-    "HYDR": "РусГидро",
-    "UPRO": "Юнипро",
-    "GMKN": "Норильский никель",
-    "PLZL": "Полюс",
-    "ALRS": "Алроса",
-    "RUAL": "Русал",
-    "MAGN": "ММК",
-    "CHMF": "Северсталь",
-    "NLMK": "НЛМК",
-    "X5":   "Корпоративный Центр Икс 5",
-    "MGNT": "Магнит",
-    "RAGR": "РусАгро",
-    "SBERP": "Сбербанк (прив.)",
-    "SBER":  "Сбербанк",
-    "T":     "Т-Технологии",
-    "VTBR":  "ВТБ",
-    "MOEX":  "Московская Биржа",
-    "YDEX": "Яндекс",
-    "ASTR": "Группа Астра",
-    "HEAD": "Хадхантер",
-    "CIAN": "Циан",
-    "AFLT": "Аэрофлот",
-    "FLOT": "Совкомфлот",
-    "MTSS": "МТС",
-    "RTKM": "Ростелеком",
-    "PRMD": "Промомед",
-    "MDMG": "Мать и дитя",
-    "OZPH": "Озон Фармацевтика",
-    "SIBN": "Газпром нефть",
-    "ROSN": "Роснефть",
-    "GAZP": "Газпром",
-    "NVTK": "НОВАТЭК",
-    "LKOH": "ЛУКОЙЛ",
+    "IRAO": "Интер РАО", "HYDR": "РусГидро", "UPRO": "Юнипро",
+    "GMKN": "Норильский никель", "PLZL": "Полюс", "ALRS": "Алроса",
+    "RUAL": "Русал", "MAGN": "ММК", "CHMF": "Северсталь", "NLMK": "НЛМК",
+    "X5": "Корпоративный Центр Икс 5", "MGNT": "Магнит", "RAGR": "РусАгро",
+    "SBERP": "Сбербанк (прив.)", "SBER": "Сбербанк", "T": "Т-Технологии",
+    "VTBR": "ВТБ", "MOEX": "Московская Биржа",
+    "YDEX": "Яндекс", "ASTR": "Группа Астра", "HEAD": "Хадхантер",
+    "CNRU": "Циан",     # ← было CIAN, стало CNRU
+    "AFLT": "Аэрофлот", "FLOT": "Совкомфлот",
+    "MTSS": "МТС", "RTKM": "Ростелеком",
+    "PRMD": "Промомед", "MDMG": "Мать и дитя", "OZPH": "Озон Фармацевтика",
+    "SIBN": "Газпром нефть", "ROSN": "Роснефть", "GAZP": "Газпром",
+    "NVTK": "НОВАТЭК", "LKOH": "ЛУКОЙЛ",
     "AKGD": "Альфа-Капитал Золото",
 }
 
-# Игнорируемые тикеры (заблокированные ETF, мелкие позиции)
-IGNORED_TICKERS = {"TECH", "TECH2", "TSPX", "TSPX2"}
+IGNORED_TICKERS = {"TECH", "TECH2", "TSPX", "TSPX2", "RUB000UTSTOM"}
 
-# ---------- Вспомогательные ----------
+# Лоты (из tinkoff_lots.py)
+LOT_BY_TICKER = {
+    "LKOH": 1, "RTKM": 10, "X5": 1, "MDMG": 1, "PLZL": 1, "AFLT": 10,
+    "FLOT": 10, "PRMD": 1, "IRAO": 100, "ALRS": 10, "HEAD": 1, "GMKN": 10,
+    "MOEX": 10, "HYDR": 1000, "UPRO": 1000, "MAGN": 10, "YDEX": 1, "T": 1,
+    "VTBR": 1, "GAZP": 10, "RAGR": 1, "SIBN": 1, "OZPH": 10, "SBERP": 1,
+    "MGNT": 1, "MTSS": 10, "RUAL": 10, "CHMF": 1, "ROSN": 1,
+    "AKGD": 1, "SU26248RMFS3": 1, "SU26254RMFS1": 1,
+    "CNYRUB_TOM_CETS": 1, "USD000UTSTOM": 1,
+    "ASTR": 1, "CNRU": 1, "NLMK": 10, "NVTK": 1,
+}
+
+# Тикеры, которые хотим докупать даже если их нет в портфеле
+WISHLIST_TICKERS = ["ASTR", "CNRU"]
+
 
 def money_to_float(money):
-    """MoneyValue из API → float."""
     return money.units + money.nano / 1e9
 
 
 def get_main_account_id(client):
-    """Возвращает ID брокерского счёта (type=1)."""
     accounts = client.users.get_accounts().accounts
     main = next((a for a in accounts if a.type == 1), None)
     if not main:
@@ -111,51 +92,44 @@ def get_main_account_id(client):
     return main.id
 
 
-# ---------- Основные функции ----------
+def get_share_info(tickers):
+    """Возвращает {ticker: {name, lot, price, figi}} для списка тикеров."""
+    result = {}
+    with Client(TOKEN) as client:
+        all_shares = client.instruments.shares().instruments
+        ticker_to_share = {s.ticker: s for s in all_shares if s.ticker in tickers}
+
+        if not ticker_to_share:
+            return result
+
+        figi_list = [s.figi for s in ticker_to_share.values()]
+        prices = client.market_data.get_last_prices(figi=figi_list).last_prices
+        figi_to_price = {p.figi: money_to_float(p.price) for p in prices}
+
+        for ticker, share in ticker_to_share.items():
+            result[ticker] = {
+                "ticker": ticker,
+                "name": NAME_BY_TICKER.get(ticker, share.name),
+                "lot": share.lot,
+                "price": figi_to_price.get(share.figi, 0.0),
+                "figi": share.figi,
+            }
+
+    return result
+
 
 def get_portfolio_snapshot():
-    """Возвращает снимок портфеля в удобной структуре.
-
-    Возвращает словарь:
-        {
-            "total_value": float,           # общая стоимость портфеля
-            "free_cash_rub": float,         # свободные рубли
-            "categories": {
-                "Акции": {"value": float, "percent": float},
-                "Облигации": {...},
-                "Золото": {...},
-                "Валюта": {...},
-            },
-            "positions": [
-                {
-                    "ticker": str,
-                    "name": str,
-                    "type": str,             # share / bond / etf / currency
-                    "sector": str | None,
-                    "quantity": float,
-                    "price": float,
-                    "value": float,
-                },
-                ...
-            ],
-            "by_sector": {
-                "IT": {"value": float, "percent": float, "positions": [...]},
-                ...
-            },
-        }
-    """
+    """Снимок портфеля в удобной структуре."""
     with Client(TOKEN) as client:
         account_id = get_main_account_id(client)
         portfolio = client.operations.get_portfolio(account_id=account_id)
         positions_info = client.operations.get_positions(account_id=account_id)
 
-        # Свободные рубли
         free_cash_rub = 0.0
         for m in positions_info.money:
             if m.currency == "rub":
                 free_cash_rub = money_to_float(m)
 
-        # Позиции
         positions = []
         for pos in portfolio.positions:
             ticker = pos.ticker
@@ -179,17 +153,12 @@ def get_portfolio_snapshot():
                 "quantity": qty,
                 "price": price,
                 "value": value,
+                "lot": LOT_BY_TICKER.get(ticker, 1),
             })
 
         total_value = money_to_float(portfolio.total_amount_portfolio)
 
-        # Категории
-        categories = {
-            "Акции": 0.0,
-            "Облигации": 0.0,
-            "Золото": 0.0,
-            "Валюта": 0.0,
-        }
+        categories = {"Акции": 0.0, "Облигации": 0.0, "Золото": 0.0, "Валюта": 0.0}
         for p in positions:
             if p["type"] == "share":
                 categories["Акции"] += p["value"]
@@ -205,7 +174,6 @@ def get_portfolio_snapshot():
             for k, v in categories.items()
         }
 
-        # Группировка акций по отраслям
         by_sector = {}
         for p in positions:
             if p["type"] != "share":
@@ -229,19 +197,3 @@ def get_portfolio_snapshot():
             "positions": positions,
             "by_sector": by_sector,
         }
-
-
-if __name__ == "__main__":
-    snap = get_portfolio_snapshot()
-    print(f"\n💰 Всего: {snap['total_value']:,.2f} ₽")
-    print(f"💵 Свободно: {snap['free_cash_rub']:,.2f} ₽\n")
-
-    print("📊 Категории:")
-    for name, data in snap["categories"].items():
-        print(f"   {name:12} {data['value']:>12,.2f} ₽  ({data['percent']:>5.2f}%)")
-
-    print("\n📈 Акции по отраслям:")
-    for sector, data in sorted(snap["by_sector"].items(), key=lambda x: x[1]["value"]):
-        print(f"\n   {sector} — {data['value']:,.2f} ₽ ({data['percent']:.2f}%)")
-        for p in data["positions"]:
-            print(f"      • {p['name']:35} {p['quantity']:>7.0f} шт × {p['price']:>9.2f} = {p['value']:>11.2f} ₽")
