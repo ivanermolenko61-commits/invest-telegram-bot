@@ -10,6 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 from tinkoff_api import get_portfolio_snapshot
+from recommender import recommend
 
 load_dotenv()
 
@@ -29,7 +30,6 @@ scheduler = AsyncIOScheduler()
 # ---------- Форматирование ----------
 
 def format_portfolio(snapshot):
-    """Краткая сводка: топ-10 позиций + итоги."""
     positions = [p for p in snapshot["positions"] if p["type"] == "share"]
     positions.sort(key=lambda p: p["value"], reverse=True)
 
@@ -60,7 +60,6 @@ def format_portfolio(snapshot):
 
 
 def format_structure(snapshot):
-    """Структура по категориям и отраслям."""
     lines = ["⚖️ <b>Структура портфеля</b>\n"]
 
     cats = snapshot["categories"]
@@ -85,6 +84,34 @@ def format_structure(snapshot):
     return "\n".join(lines)
 
 
+def format_plan(snapshot, recs):
+    """Форматирует план покупок."""
+    if not recs:
+        return (
+            "✅ <b>Рекомендаций нет</b>\n\n"
+            f"Свободно: {snapshot['free_cash_rub']:,.2f} ₽\n"
+            "Либо всё на цели, либо не хватает на минимальную покупку."
+        )
+
+    lines = [f"🎯 <b>План покупок на {snapshot['free_cash_rub']:,.2f} ₽</b>\n"]
+
+    total = 0
+    for i, r in enumerate(recs, 1):
+        lines.append(
+            f"{i}. [{r['category']}] <b>{r['name']}</b>\n"
+            f"   {r['quantity']:.0f} шт × {r['price']:.2f} ₽ = "
+            f"{r['amount']:,.2f} ₽\n"
+            f"   <i>{r['comment']}</i>"
+        )
+        total += r["amount"]
+
+    lines.append(f"\n💰 <b>Итого:</b> {total:,.2f} ₽")
+    lines.append(f"💵 <b>Остаток:</b> {snapshot['free_cash_rub'] - total:,.2f} ₽")
+    lines.append("\n<i>Проверяйте актуальные цены перед покупкой.</i>")
+
+    return "\n".join(lines)
+
+
 # ---------- Команды ----------
 
 @dp.message(CommandStart())
@@ -95,6 +122,7 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/portfolio — топ-10 позиций\n"
         "/structure — структура по категориям\n"
+        "/what_to_buy — план покупок на свободные деньги\n"
         "/help — справка",
         parse_mode="HTML",
     )
@@ -110,7 +138,8 @@ async def cmd_help(message: Message):
         "/start — приветствие\n"
         "/help — эта справка\n"
         "/portfolio — топ-10 позиций\n"
-        "/structure — категории и отрасли",
+        "/structure — категории и отрасли\n"
+        "/what_to_buy — что купить на свободные средства",
         parse_mode="HTML",
     )
 
@@ -138,13 +167,24 @@ async def cmd_structure(message: Message):
         snapshot = get_portfolio_snapshot()
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
-        await message.answer(
-            f"⚠️ Ошибка: <code>{e}</code>",
-            parse_mode="HTML",
-        )
+        await message.answer(f"⚠️ Ошибка: <code>{e}</code>", parse_mode="HTML")
         return
 
     await message.answer(format_structure(snapshot), parse_mode="HTML")
+
+
+@dp.message(Command("what_to_buy"))
+async def cmd_what_to_buy(message: Message):
+    await message.answer("⏳ Считаю рекомендации…")
+    try:
+        snapshot = get_portfolio_snapshot()
+        recs = recommend(snapshot)
+    except Exception as e:
+        logging.exception("Ошибка рекомендаций")
+        await message.answer(f"⚠️ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        return
+
+    await message.answer(format_plan(snapshot, recs), parse_mode="HTML")
 
 
 # ---------- Планировщик ----------
