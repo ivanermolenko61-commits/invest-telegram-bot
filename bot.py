@@ -2,8 +2,9 @@
 import asyncio
 import logging
 import os
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -12,6 +13,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    TelegramObject,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -47,6 +49,37 @@ SECTOR_EMOJI = {
     "Энергетика": "🛢️",
     "Прочее": "🔸",
 }
+
+
+# ---------- Middleware: доступ только для владельца ----------
+
+class WhitelistMiddleware(BaseMiddleware):
+    """Пропускает только сообщения от MY_CHAT_ID. Остальные молча игнорирует."""
+
+    def __init__(self, allowed_user_id: int):
+        self.allowed_user_id = allowed_user_id
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user and user.id == self.allowed_user_id:
+            return await handler(event, data)
+
+        # Чужой пользователь — молчим, ничего не отвечаем
+        logging.warning(
+            f"Отклонён доступ: user_id={user.id if user else 'unknown'}, "
+            f"username={user.username if user else 'unknown'}"
+        )
+        return None
+
+
+# Регистрируем middleware на сообщения и callback-кнопки
+dp.message.middleware(WhitelistMiddleware(MY_CHAT_ID))
+dp.callback_query.middleware(WhitelistMiddleware(MY_CHAT_ID))
 
 
 # ---------- Клавиатуры ----------
@@ -585,7 +618,7 @@ async def main():
     scheduler.start()
     logging.info("Планировщик запущен: ежедневный отчёт в 19:00")
 
-    logging.info("Бот запущен")
+    logging.info(f"Бот запущен. Разрешён только user_id={MY_CHAT_ID}")
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
