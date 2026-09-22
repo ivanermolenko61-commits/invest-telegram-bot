@@ -8,6 +8,7 @@ from collections import OrderedDict
 from tinkoff_api import (
     get_portfolio_snapshot,
     get_share_info,
+    get_top_ofz,
     SECTOR_BY_TICKER,
     NAME_BY_TICKER,
 )
@@ -135,6 +136,7 @@ def recommend_gold(snapshot, budget):
 
 
 def recommend_bonds(snapshot, budget):
+    """Добор облигаций до 15%. Берём самую доходную ОФЗ со всей биржи (топ по YTM)."""
     cats = snapshot["categories"]
     total = snapshot["total_with_cash"]
     gap = total * TARGETS["Облигации"] / 100 - cats["Облигации"]["value"]
@@ -142,12 +144,25 @@ def recommend_bonds(snapshot, budget):
     if gap <= 0 or budget <= 0:
         return None, budget
 
-    bonds = [p for p in snapshot["positions"] if p["type"] == "bond"]
-    if not bonds:
-        return None, budget
+    # Топ ОФЗ со всей биржи по YTM
+    try:
+        top_ofz = get_top_ofz(limit=3)
+    except Exception:
+        top_ofz = []
 
-    cheapest = min(bonds, key=lambda b: b["price"] * b["lot"])
-    price, lot = cheapest["price"], cheapest["lot"]
+    best_ytm = None
+    if top_ofz:
+        best = top_ofz[0]
+        best_ytm = best["ytm"]
+    else:
+        # Fallback — самая дешёвая из портфеля
+        bonds = [p for p in snapshot["positions"] if p["type"] == "bond"]
+        if not bonds:
+            return None, budget
+        best = min(bonds, key=lambda b: b["price"] * b["lot"])
+
+    price = best["price"]
+    lot = best["lot"]
     lot_price = price * lot
 
     n = calc_qty(gap, lot_price, budget, max_overshoot=1.5)
@@ -156,12 +171,19 @@ def recommend_bonds(snapshot, budget):
 
     qty = n * lot
     amount = qty * price
+
+    comment = f"Облигации {cats['Облигации']['percent']:.2f}% → цель {TARGETS['Облигации']}%"
+    if best_ytm:
+        comment += f" · YTM {best_ytm:.2f}%"
+    if best.get("maturity"):
+        comment += f" · до {best['maturity']}"
+
     return {
         "category": "Облигации", "sector": None,
-        "name": NAME_BY_TICKER.get(cheapest["ticker"], cheapest["name"]),
-        "ticker": cheapest["ticker"],
+        "name": best["name"],
+        "ticker": best["ticker"],
         "quantity": qty, "price": price, "amount": amount,
-        "comment": f"Облигации {cats['Облигации']['percent']:.2f}% → цель {TARGETS['Облигации']}%",
+        "comment": comment,
     }, budget - amount
 
 
@@ -203,10 +225,6 @@ def _build_by_sector(positions):
 
 
 def _try_buy_one_lot(sector_data, budget):
-    """Пытается купить 1 лот в самой отстающей компании отрасли.
-
-    Возвращает (рекомендация, потрачено) или (None, 0), если ничего не купить.
-    """
     companies = sorted(
         sector_data["positions"],
         key=lambda x: (x["value"], x["ticker"]),
@@ -217,20 +235,19 @@ def _try_buy_one_lot(sector_data, budget):
         lot_price = price * lot
         if lot_price <= 0 or lot_price > budget:
             continue
-
         return company, lot, lot_price
     return None, 0, 0
 
 
 def recommend_stocks(snapshot, budget, debug=False):
-    """Волновой алгоритм + финальный проход (оба — по 1 лоту за раз)."""
+    """Волновой алгоритм + финальный проход (оба — по 1 лоту)."""
     if budget <= 0:
         return [], budget
 
     positions = _prepare_positions(snapshot, debug=debug)
     recommendations = []
 
-    # ========== ОСНОВНОЙ ЦИКЛ: учёт gap до следующей отрасли ==========
+    # ========== ОСНОВНОЙ ЦИКЛ ==========
     for iteration in range(1000):
         if budget <= 0:
             break
@@ -304,9 +321,7 @@ def recommend_stocks(snapshot, budget, debug=False):
                 print(f"\n[DEBUG] Основной цикл завершён. Остаток: {budget:.2f}₽")
             break
 
-    # ========== ФИНАЛЬНЫЙ ПРОХОД: по 1 лоту, БЕЗ gap, волнами ==========
-    # Покупаем в самой отстающей отрасли самую отстающую компанию,
-    # по ОДНОМУ лоту за раз, с пересчётом после каждой покупки.
+    # ========== ФИНАЛЬНЫЙ ПРОХОД ==========
     for iteration in range(1000):
         if budget <= 0:
             break
@@ -317,7 +332,6 @@ def recommend_stocks(snapshot, budget, debug=False):
         bought = False
         for sector_name, sector_data in sorted_sectors[:5]:
             company, lot, lot_price = _try_buy_one_lot(sector_data, budget)
-
             if company is None:
                 continue
 

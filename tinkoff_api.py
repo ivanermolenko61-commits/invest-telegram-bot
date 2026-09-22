@@ -1,5 +1,8 @@
 """Модуль для работы с T-Invest API: портфель, позиции, свободные средства."""
 import os
+import time
+from datetime import datetime
+
 from dotenv import load_dotenv
 from t_tech.invest import Client
 
@@ -9,40 +12,18 @@ TOKEN = os.getenv("TINKOFF_TOKEN")
 # ---------- Классификация акций ----------
 
 SECTOR_BY_TICKER = {
-    "IRAO": "Электроэнергетика",
-    "HYDR": "Электроэнергетика",
-    "UPRO": "Электроэнергетика",
-    "GMKN": "Сырьевая",
-    "PLZL": "Сырьевая",
-    "ALRS": "Сырьевая",
-    "RUAL": "Сырьевая",
-    "MAGN": "Сырьевая",
-    "CHMF": "Сырьевая",
-    "NLMK": "Сырьевая",
-    "X5":   "Потребительские",
-    "MGNT": "Потребительские",
-    "RAGR": "Потребительские",
-    "SBERP": "Финансовый",
-    "SBER":  "Финансовый",
-    "T":     "Финансовый",
-    "VTBR":  "Финансовый",
-    "MOEX":  "Финансовый",
-    "YDEX": "IT",
-    "ASTR": "IT",
-    "HEAD": "IT",
-    "CNRU": "IT",
-    "AFLT": "Машиностроение и транспорт",
-    "FLOT": "Машиностроение и транспорт",
-    "MTSS": "Телекоммуникации",
-    "RTKM": "Телекоммуникации",
-    "PRMD": "Здравоохранение",
-    "MDMG": "Здравоохранение",
-    "OZPH": "Здравоохранение",
-    "SIBN": "Энергетика",
-    "ROSN": "Энергетика",
-    "GAZP": "Энергетика",
-    "NVTK": "Энергетика",
-    "LKOH": "Энергетика",
+    "IRAO": "Электроэнергетика", "HYDR": "Электроэнергетика", "UPRO": "Электроэнергетика",
+    "GMKN": "Сырьевая", "PLZL": "Сырьевая", "ALRS": "Сырьевая",
+    "RUAL": "Сырьевая", "MAGN": "Сырьевая", "CHMF": "Сырьевая", "NLMK": "Сырьевая",
+    "X5": "Потребительские", "MGNT": "Потребительские", "RAGR": "Потребительские",
+    "SBERP": "Финансовый", "SBER": "Финансовый", "T": "Финансовый",
+    "VTBR": "Финансовый", "MOEX": "Финансовый",
+    "YDEX": "IT", "ASTR": "IT", "HEAD": "IT", "CNRU": "IT",
+    "AFLT": "Машиностроение и транспорт", "FLOT": "Машиностроение и транспорт",
+    "MTSS": "Телекоммуникации", "RTKM": "Телекоммуникации",
+    "PRMD": "Здравоохранение", "MDMG": "Здравоохранение", "OZPH": "Здравоохранение",
+    "SIBN": "Энергетика", "ROSN": "Энергетика", "GAZP": "Энергетика",
+    "NVTK": "Энергетика", "LKOH": "Энергетика",
 }
 
 NAME_BY_TICKER = {
@@ -52,8 +33,7 @@ NAME_BY_TICKER = {
     "X5": "Корпоративный Центр Икс 5", "MGNT": "Магнит", "RAGR": "РусАгро",
     "SBERP": "Сбербанк (прив.)", "SBER": "Сбербанк", "T": "Т-Технологии",
     "VTBR": "ВТБ", "MOEX": "Московская Биржа",
-    "YDEX": "Яндекс", "ASTR": "Группа Астра", "HEAD": "Хадхантер",
-    "CNRU": "Циан",
+    "YDEX": "Яндекс", "ASTR": "Группа Астра", "HEAD": "Хадхантер", "CNRU": "Циан",
     "AFLT": "Аэрофлот", "FLOT": "Совкомфлот",
     "MTSS": "МТС", "RTKM": "Ростелеком",
     "PRMD": "Промомед", "MDMG": "Мать и дитя", "OZPH": "Озон Фармацевтика",
@@ -66,7 +46,6 @@ NAME_BY_TICKER = {
 
 IGNORED_TICKERS = {"TECH", "TECH2", "TSPX", "TSPX2", "RUB000UTSTOM"}
 
-# Лоты (из tinkoff_lots.py)
 LOT_BY_TICKER = {
     "LKOH": 1, "RTKM": 10, "X5": 1, "MDMG": 1, "PLZL": 1, "AFLT": 10,
     "FLOT": 10, "PRMD": 1, "IRAO": 100, "ALRS": 10, "HEAD": 1, "GMKN": 10,
@@ -78,9 +57,6 @@ LOT_BY_TICKER = {
     "ASTR": 1, "CNRU": 1, "NLMK": 10, "NVTK": 1,
 }
 
-# Тикеры, которые хотим докупать даже если их нет в портфеле
-WISHLIST_TICKERS = ["ASTR", "CNRU"]
-
 
 def money_to_float(money):
     """MoneyValue из API → float."""
@@ -88,7 +64,7 @@ def money_to_float(money):
 
 
 def get_main_account_id(client):
-    """Возвращает ID брокерского счёта (type=1)."""
+    """ID брокерского счёта (type=1)."""
     accounts = client.users.get_accounts().accounts
     main = next((a for a in accounts if a.type == 1), None)
     if not main:
@@ -97,7 +73,7 @@ def get_main_account_id(client):
 
 
 def get_share_info(tickers):
-    """Возвращает {ticker: {name, lot, price, figi}} для списка тикеров."""
+    """{ticker: {name, lot, price, figi}} для списка тикеров."""
     result = {}
     with Client(TOKEN) as client:
         all_shares = client.instruments.shares().instruments
@@ -122,19 +98,102 @@ def get_share_info(tickers):
     return result
 
 
-def get_portfolio_snapshot():
-    """Снимок портфеля в удобной структуре.
+# ---------- Подбор лучших ОФЗ со всей биржи ----------
 
-    Возвращает словарь:
-        {
-            "total_value": float,           # стоимость активов
-            "free_cash_rub": float,         # свободные рубли
-            "total_with_cash": float,       # активы + свободные (полный портфель)
-            "categories": {...},
-            "positions": [...],
-            "by_sector": {...},
+_OFZ_CACHE = {"data": None, "ts": 0}
+_OFZ_CACHE_TTL = 3600  # секунд
+
+
+def _calc_ofz_ytm(client, bond, price_rub):
+    """Считает YTM одной ОФЗ. Возвращает dict или None."""
+    try:
+        coupons = client.instruments.get_bond_coupons(
+            figi=bond.figi,
+            from_=datetime.now(),
+            to=bond.maturity_date.replace(tzinfo=None),
+        ).events
+
+        if not coupons or bond.coupon_quantity_per_year == 0:
+            return None
+
+        coupon_payment = money_to_float(coupons[0].pay_one_bond)
+        if coupon_payment <= 0:
+            return None
+
+        annual_coupon = coupon_payment * bond.coupon_quantity_per_year
+        nominal = money_to_float(bond.nominal)
+
+        now_naive = datetime.now()
+        maturity_naive = bond.maturity_date.replace(tzinfo=None)
+        days = (maturity_naive - now_naive).days
+        years = days / 365.25
+        if years < 1.0:
+            return None
+
+        ytm = (annual_coupon + (nominal - price_rub) / years) / price_rub * 100
+
+        if not (5.0 <= ytm <= 40.0):
+            return None
+
+        return {
+            "ticker": bond.ticker,
+            "figi": bond.figi,
+            "name": NAME_BY_TICKER.get(bond.ticker, bond.name),
+            "price": round(price_rub, 2),
+            "nominal": nominal,
+            "annual_coupon": round(annual_coupon, 2),
+            "years": round(years, 2),
+            "maturity": bond.maturity_date.strftime("%Y-%m-%d"),
+            "lot": bond.lot,
+            "ytm": round(ytm, 2),
         }
+    except Exception:
+        return None
+
+
+def get_top_ofz(limit=5, use_cache=True):
+    """Топ-N ОФЗ по YTM со всей биржи.
+
+    Кэшируется на 1 час — первый вызов ~5-10 сек, последующие мгновенно.
     """
+    if use_cache and _OFZ_CACHE["data"] is not None:
+        if time.time() - _OFZ_CACHE["ts"] < _OFZ_CACHE_TTL:
+            return _OFZ_CACHE["data"][:limit]
+
+    with Client(TOKEN) as client:
+        all_bonds = client.instruments.bonds().instruments
+        ofz = [b for b in all_bonds if b.ticker.startswith("SU")]
+
+        figi_list = [b.figi for b in ofz]
+        prices_resp = client.market_data.get_last_prices(figi=figi_list).last_prices
+        figi_to_raw = {p.figi: money_to_float(p.price) for p in prices_resp}
+
+        results = []
+        for b in ofz:
+            raw = figi_to_raw.get(b.figi, 0)
+            if raw <= 0:
+                continue
+
+            nominal = money_to_float(b.nominal)
+            # API возвращает цену в % от номинала
+            price_rub = raw / 100 * nominal if (nominal > 500 and raw < 200) else raw
+
+            info = _calc_ofz_ytm(client, b, price_rub)
+            if info:
+                results.append(info)
+
+        results.sort(key=lambda x: x["ytm"], reverse=True)
+
+        _OFZ_CACHE["data"] = results
+        _OFZ_CACHE["ts"] = time.time()
+
+        return results[:limit]
+
+
+# ---------- Снимок портфеля ----------
+
+def get_portfolio_snapshot():
+    """Снимок портфеля в удобной структуре."""
     with Client(TOKEN) as client:
         account_id = get_main_account_id(client)
         portfolio = client.operations.get_portfolio(account_id=account_id)
@@ -169,10 +228,10 @@ def get_portfolio_snapshot():
                 "price": price,
                 "value": value,
                 "lot": LOT_BY_TICKER.get(ticker, 1),
+                "figi": pos.figi,
             })
 
         total_value = money_to_float(portfolio.total_amount_portfolio)
-        # Полная стоимость портфеля = активы + свободные деньги
         total_with_cash = total_value + free_cash_rub
 
         categories = {"Акции": 0.0, "Облигации": 0.0, "Золото": 0.0, "Валюта": 0.0}
@@ -186,7 +245,6 @@ def get_portfolio_snapshot():
             elif p["type"] == "etf" and p["ticker"] == "AKGD":
                 categories["Золото"] += p["value"]
 
-        # Проценты считаем от ПОЛНОГО портфеля (активы + свободные деньги)
         categories_pct = {
             k: round(v / total_with_cash * 100, 2) if total_with_cash else 0
             for k, v in categories.items()
