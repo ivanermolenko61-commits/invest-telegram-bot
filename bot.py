@@ -9,7 +9,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -32,21 +34,32 @@ MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
 scheduler = AsyncIOScheduler()
 
 
+SECTOR_EMOJI = {
+    "Электроэнергетика": "⚡",
+    "Сырьевая": "⛏️",
+    "Потребительские": "🛒",
+    "Финансовый": "💰",
+    "IT": "💻",
+    "Машиностроение и транспорт": "✈️",
+    "Телекоммуникации": "📡",
+    "Здравоохранение": "🏥",
+    "Энергетика": "🛢️",
+    "Прочее": "🔸",
+}
+
+
 # ---------- Клавиатуры ----------
 
-def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 Портфель", callback_data="portfolio"),
-            InlineKeyboardButton(text="⚖️ Структура", callback_data="structure"),
+def main_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Портфель"), KeyboardButton(text="⚖️ Структура")],
+            [KeyboardButton(text="🎯 Что купить")],
+            [KeyboardButton(text="📖 Справка")],
         ],
-        [
-            InlineKeyboardButton(text="🎯 Что купить", callback_data="buy_menu"),
-        ],
-        [
-            InlineKeyboardButton(text="📖 Справка", callback_data="help"),
-        ],
-    ])
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def buy_menu_kb():
@@ -71,6 +84,17 @@ def buy_menu_kb():
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="back")],
+    ])
+
+
+def main_inline_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Портфель", callback_data="portfolio"),
+            InlineKeyboardButton(text="⚖️ Структура", callback_data="structure"),
+        ],
+        [InlineKeyboardButton(text="🎯 Что купить", callback_data="buy_menu")],
+        [InlineKeyboardButton(text="📖 Справка", callback_data="help")],
     ])
 
 
@@ -126,12 +150,13 @@ def format_structure(snapshot):
     lines.append("\n<b>Отрасли (акции):</b>")
     sectors = sorted(snapshot["by_sector"].items(), key=lambda x: x[1]["value"])
     for sector, data in sectors:
-        lines.append(f"• {sector}: {data['percent']:.2f}%")
+        icon = SECTOR_EMOJI.get(sector, "🔸")
+        lines.append(f"{icon} {sector}: {data['percent']:.2f}%")
 
     return "\n".join(lines)
 
 
-def format_plan(recs, budget):
+def format_plan(recs, budget, snapshot=None):
     if not recs:
         return (
             "✅ <b>Рекомендаций нет.</b>\n\n"
@@ -141,6 +166,16 @@ def format_plan(recs, budget):
     by_cat = {}
     for r in recs:
         by_cat.setdefault(r["category"], []).append(r)
+
+    # Для расчёта «было → стало» по акциям
+    stocks_now = 0.0
+    stocks_add = 0.0
+    if snapshot:
+        stocks_now = snapshot["categories"]["Акции"]["value"]
+    # Сумма всех акционных покупок
+    for r in by_cat.get("Акции", []):
+        stocks_add += r["amount"]
+    stocks_after = stocks_now + stocks_add
 
     lines = [f"📋 <b>План покупок на {budget:,.0f} ₽</b>"]
 
@@ -168,11 +203,29 @@ def format_plan(recs, budget):
 
             for sector, sector_items in sectors_sorted:
                 sector_sum = sum(r["amount"] for r in sector_items)
-                lines.append(f"\n   🔸 <b>{sector}</b> ({sector_sum:,.0f} ₽)")
+                icon = SECTOR_EMOJI.get(sector, "🔸")
+
+                # Считаем «было → стало» для отрасли
+                pct_now = None
+                pct_after = None
+                if snapshot and sector in snapshot.get("by_sector", {}):
+                    if stocks_now > 0 and stocks_after > 0:
+                        sector_now = snapshot["by_sector"][sector]["value"]
+                        sector_after = sector_now + sector_sum
+                        pct_now = sector_now / stocks_now * 100
+                        pct_after = sector_after / stocks_after * 100
+
+                header = f"\n   {icon} <b>{sector}</b> ({sector_sum:,.0f} ₽)"
+                if pct_now is not None and pct_after is not None:
+                    header += f" · {pct_now:.1f}% → {pct_after:.1f}%"
+                lines.append(header)
+
                 for r in sector_items:
                     name_part = r["comment"]
                     if ": " in name_part:
                         name_part = name_part.split(": ", 1)[1]
+                    name_part = name_part.replace(" (добор)", "")
+
                     lines.append(
                         f"      • <b>{r['ticker']}</b> — {name_part}\n"
                         f"        {r['quantity']:.0f} шт × {r['price']:.2f} ₽ "
@@ -180,7 +233,6 @@ def format_plan(recs, budget):
                     )
                     total_plan += r["amount"]
         else:
-            # Валюта, Золото, Облигации — с тикером
             for r in items:
                 lines.append(
                     f"   • <b>{r['name']}</b> ({r['ticker']})\n"
@@ -206,8 +258,8 @@ def help_text():
         "📊 Портфель — топ-10 позиций\n"
         "⚖️ Структура — категории и отрасли\n"
         "🎯 Что купить — план покупок на сумму\n\n"
-        "В разделе «Что купить» можно выбрать "
-        "быструю сумму или указать вручную:\n"
+        "Кнопки внизу экрана всегда под рукой.\n"
+        "В разделе «Что купить» можно указать сумму вручную:\n"
         "<code>/what_to_buy 15000</code>"
     )
 
@@ -219,17 +271,17 @@ async def cmd_start(message: Message):
     await message.answer(
         f"Привет, {message.from_user.full_name}!\n\n"
         "Я — твой инвестиционный помощник.\n"
-        "Выбери действие кнопкой ниже 👇",
-        reply_markup=main_menu_kb(),
+        "Пользуйся кнопками внизу экрана 👇",
+        reply_markup=main_reply_kb(),
     )
 
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     await message.answer(
-        "🎛 <b>Главное меню</b>",
+        "🎛 <b>Главное меню</b>\n\nКнопки — внизу экрана.",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_reply_kb(),
     )
 
 
@@ -301,7 +353,6 @@ async def cmd_what_to_buy(message: Message):
 
 
 async def _send_plan(message: Message, override):
-    """Считает и отправляет план."""
     try:
         snapshot = get_portfolio_snapshot()
         budget = override if override is not None else snapshot["free_cash_rub"]
@@ -325,20 +376,48 @@ async def _send_plan(message: Message, override):
         return
 
     await message.answer(
-        format_plan(recs, budget),
+        format_plan(recs, budget, snapshot),
         parse_mode="HTML",
         reply_markup=back_kb(),
     )
 
 
-# ---------- Callback-обработчики ----------
+# ---------- Reply-кнопки ----------
+
+@dp.message(F.text == "📊 Портфель")
+async def msg_portfolio(message: Message):
+    await cmd_portfolio(message)
+
+
+@dp.message(F.text == "⚖️ Структура")
+async def msg_structure(message: Message):
+    await cmd_structure(message)
+
+
+@dp.message(F.text == "🎯 Что купить")
+async def msg_buy(message: Message):
+    await message.answer(
+        "💰 <b>На какую сумму считать план?</b>\n\n"
+        "Выбери быструю сумму или отправь вручную:\n"
+        "<code>/what_to_buy 50000</code>",
+        parse_mode="HTML",
+        reply_markup=buy_menu_kb(),
+    )
+
+
+@dp.message(F.text == "📖 Справка")
+async def msg_help(message: Message):
+    await message.answer(help_text(), parse_mode="HTML", reply_markup=back_kb())
+
+
+# ---------- Callback ----------
 
 @dp.callback_query(F.data == "back")
 async def cb_back(callback: CallbackQuery):
     await callback.message.edit_text(
         "🎛 <b>Главное меню</b>",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_inline_kb(),
     )
     await callback.answer()
 
@@ -435,7 +514,12 @@ async def send_daily_report():
             + "\n\n"
             + format_structure(snapshot)
         )
-        await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML")
+        await bot.send_message(
+            chat_id=MY_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=main_reply_kb(),
+        )
         logging.info("Отчёт отправлен")
     except Exception:
         logging.exception("Ошибка при отправке отчёта")
