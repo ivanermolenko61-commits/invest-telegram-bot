@@ -1,3 +1,4 @@
+--extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 aiofiles==25.1.0
 aiogram==3.31.0
 aiohappyeyeballs==2.7.1
@@ -66,5 +67,4 @@ urllib3==2.8.0
 wrapt==2.4.1
 yandex-ai-studio-sdk==0.22.1
 yandex-cloud-ml-sdk==0.19.1
-yandexcloud==0.408.0
 yarl==1.25.1
