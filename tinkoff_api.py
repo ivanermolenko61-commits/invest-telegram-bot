@@ -1,4 +1,5 @@
 """Модуль для работы с T-Invest API: портфель, позиции, свободные средства."""
+import json
 import os
 import time
 from datetime import datetime
@@ -100,8 +101,32 @@ def get_share_info(tickers):
 
 # ---------- Подбор лучших ОФЗ со всей биржи ----------
 
-_OFZ_CACHE = {"data": None, "ts": 0}
+_OFZ_CACHE_FILE = "ofz_cache.json"
 _OFZ_CACHE_TTL = 3600  # секунд
+_OFZ_CACHE = {"data": None, "ts": 0}
+
+
+def _load_ofz_cache_from_disk():
+    """Загружает кэш ОФЗ с диска (если файл есть и не устарел)."""
+    if not os.path.exists(_OFZ_CACHE_FILE):
+        return None
+    try:
+        with open(_OFZ_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if time.time() - cached.get("ts", 0) < _OFZ_CACHE_TTL:
+            return cached.get("data")
+    except Exception:
+        pass
+    return None
+
+
+def _save_ofz_cache_to_disk(data):
+    """Сохраняет кэш ОФЗ на диск."""
+    try:
+        with open(_OFZ_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "data": data}, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def _calc_ofz_ytm(client, bond, price_rub):
@@ -151,14 +176,34 @@ def _calc_ofz_ytm(client, bond, price_rub):
         return None
 
 
-def get_top_ofz(limit=5, use_cache=True):
+def get_top_ofz(limit=5, use_cache=True, debug=False):
     """Топ-N ОФЗ по YTM со всей биржи.
 
-    Кэшируется на 1 час — первый вызов ~5-10 сек, последующие мгновенно.
+    Кэш:
+      - В памяти (быстро, но сбрасывается при перезапуске)
+      - На диске в ofz_cache.json (переживает перезапуски)
+      - TTL = 1 час
+
+    Пауза 0.1 сек между запросами — чтобы не получить RESOURCE_EXHAUSTED.
     """
+    # 1. Проверяем кэш в памяти
     if use_cache and _OFZ_CACHE["data"] is not None:
         if time.time() - _OFZ_CACHE["ts"] < _OFZ_CACHE_TTL:
             return _OFZ_CACHE["data"][:limit]
+
+    # 2. Проверяем кэш на диске
+    if use_cache:
+        disk_data = _load_ofz_cache_from_disk()
+        if disk_data:
+            _OFZ_CACHE["data"] = disk_data
+            _OFZ_CACHE["ts"] = time.time()
+            if debug:
+                print(f"[OFZ] Загружено из дискового кэша: {len(disk_data)}")
+            return disk_data[:limit]
+
+    # 3. Считаем заново
+    if debug:
+        print(f"[OFZ] Считаю YTM для всех ОФЗ (с паузой 0.1 сек)...")
 
     with Client(TOKEN) as client:
         all_bonds = client.instruments.bonds().instruments
@@ -169,7 +214,7 @@ def get_top_ofz(limit=5, use_cache=True):
         figi_to_raw = {p.figi: money_to_float(p.price) for p in prices_resp}
 
         results = []
-        for b in ofz:
+        for i, b in enumerate(ofz):
             raw = figi_to_raw.get(b.figi, 0)
             if raw <= 0:
                 continue
@@ -182,10 +227,17 @@ def get_top_ofz(limit=5, use_cache=True):
             if info:
                 results.append(info)
 
+            # Пауза, чтобы не получить бан
+            time.sleep(0.1)
+
         results.sort(key=lambda x: x["ytm"], reverse=True)
 
         _OFZ_CACHE["data"] = results
         _OFZ_CACHE["ts"] = time.time()
+        _save_ofz_cache_to_disk(results)
+
+        if debug:
+            print(f"[OFZ] Готово: {len(results)} ОФЗ, топ YTM = {results[0]['ytm'] if results else '—'}")
 
         return results[:limit]
 
