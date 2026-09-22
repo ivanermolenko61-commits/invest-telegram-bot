@@ -3,6 +3,8 @@
 Приоритет: Валюта → Золото → Облигации → Акции.
 Внутри акций — волновой алгоритм по отстающим отраслям + финальный проход.
 Внутри валюты — баланс USD ↔ CNY (по 2.5% на каждую).
+
+Классификация бумаг — через API (без хардкода тикеров).
 """
 from collections import OrderedDict
 
@@ -10,24 +12,11 @@ from tinkoff_api import (
     get_portfolio_snapshot,
     get_share_info,
     get_top_ofz,
-    SECTOR_BY_TICKER,
-    NAME_BY_TICKER,
+    BUY_LIST,
 )
 
 
 TARGETS = {"Валюта": 5.0, "Золото": 10.0, "Облигации": 15.0, "Акции": 70.0}
-
-BUY_LIST = [
-    "ASTR", "CNRU", "YDEX", "HEAD",
-    "NLMK", "ALRS", "RUAL", "MAGN", "CHMF", "PLZL", "GMKN",
-    "PRMD", "MDMG", "OZPH",
-    "SIBN", "ROSN", "GAZP", "NVTK", "LKOH",
-    "SBERP", "T", "VTBR", "MOEX",
-    "X5", "MGNT", "RAGR",
-    "MTSS", "RTKM",
-    "AFLT", "FLOT",
-    "IRAO", "HYDR", "UPRO",
-]
 
 
 def _adjust_snapshot_for_budget(snapshot, effective_free_cash):
@@ -274,10 +263,14 @@ def _prepare_positions(snapshot, debug=False):
             if info["price"] <= 0:
                 continue
             positions.append({
-                "ticker": ticker, "name": info["name"], "type": "share",
-                "sector": SECTOR_BY_TICKER.get(ticker, "Прочее"),
-                "quantity": 0.0, "price": info["price"],
-                "value": 0.0, "lot": info["lot"],
+                "ticker": ticker,
+                "name": info["name"],
+                "type": "share",
+                "sector": info["sector"],   # ← sector из API
+                "quantity": 0.0,
+                "price": info["price"],
+                "value": 0.0,
+                "lot": info["lot"],
             })
 
     return positions
@@ -324,6 +317,9 @@ def recommend_stocks(snapshot, budget, debug=False):
         by_sector = _build_by_sector(positions)
         sorted_sectors = sorted(by_sector.items(), key=lambda x: x[1]["value"])
 
+        if not sorted_sectors:
+            break
+
         if debug and iteration < 10:
             print(f"\n[DEBUG] Итерация {iteration+1}. Бюджет: {budget:.2f}₽")
             print(f"[DEBUG] Топ-5: {[(s, round(d['value'], 2)) for s, d in sorted_sectors[:5]]}")
@@ -365,8 +361,6 @@ def recommend_stocks(snapshot, budget, debug=False):
             if company_gap <= 0:
                 company_gap = lot_price
 
-            # Не даём company_gap схлопнуть покупку:
-            # если внутри отрасли перекос минимальный — ограничиваем только по отрасли
             if company_gap < lot_price:
                 effective_gap = sector_gap
             else:
@@ -430,7 +424,7 @@ def recommend_stocks(snapshot, budget, debug=False):
 
             if debug and iteration < 10:
                 print(f"[DEBUG] Финальный {iteration+1}: {company['ticker']} "
-                      f"{qty} шт за {amount:.2f}₽ (бюджет → {budget - amount:.2f}₽)")
+                      f"{qty} шт за {amount:.2f}₽")
 
             company["value"] += amount
             company["quantity"] += qty
@@ -439,8 +433,6 @@ def recommend_stocks(snapshot, budget, debug=False):
             break
 
         if not bought:
-            if debug:
-                print(f"\n[DEBUG] Финальный проход: больше нечего купить. Остаток: {budget:.2f}₽")
             break
 
     return recommendations, budget
