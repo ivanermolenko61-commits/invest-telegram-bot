@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from tinkoff_api import get_portfolio_snapshot
 from recommender import recommend
+from ai_advisor import analyze_portfolio, is_enabled
 
 load_dotenv()
 
@@ -55,6 +56,7 @@ def main_reply_kb():
         keyboard=[
             [KeyboardButton(text="📊 Портфель"), KeyboardButton(text="⚖️ Структура")],
             [KeyboardButton(text="🎯 Что купить")],
+            [KeyboardButton(text="🤖 AI-анализ")],
             [KeyboardButton(text="📖 Справка")],
         ],
         resize_keyboard=True,
@@ -94,6 +96,7 @@ def main_inline_kb():
             InlineKeyboardButton(text="⚖️ Структура", callback_data="structure"),
         ],
         [InlineKeyboardButton(text="🎯 Что купить", callback_data="buy_menu")],
+        [InlineKeyboardButton(text="🤖 AI-анализ", callback_data="analyze")],
         [InlineKeyboardButton(text="📖 Справка", callback_data="help")],
     ])
 
@@ -167,12 +170,10 @@ def format_plan(recs, budget, snapshot=None):
     for r in recs:
         by_cat.setdefault(r["category"], []).append(r)
 
-    # Для расчёта «было → стало» по акциям
     stocks_now = 0.0
     stocks_add = 0.0
     if snapshot:
         stocks_now = snapshot["categories"]["Акции"]["value"]
-    # Сумма всех акционных покупок
     for r in by_cat.get("Акции", []):
         stocks_add += r["amount"]
     stocks_after = stocks_now + stocks_add
@@ -205,7 +206,6 @@ def format_plan(recs, budget, snapshot=None):
                 sector_sum = sum(r["amount"] for r in sector_items)
                 icon = SECTOR_EMOJI.get(sector, "🔸")
 
-                # Считаем «было → стало» для отрасли
                 pct_now = None
                 pct_after = None
                 if snapshot and sector in snapshot.get("by_sector", {}):
@@ -257,7 +257,8 @@ def help_text():
         "<b>Возможности:</b>\n"
         "📊 Портфель — топ-10 позиций\n"
         "⚖️ Структура — категории и отрасли\n"
-        "🎯 Что купить — план покупок на сумму\n\n"
+        "🎯 Что купить — план покупок на сумму\n"
+        "🤖 AI-анализ — анализ от YandexGPT\n\n"
         "Кнопки внизу экрана всегда под рукой.\n"
         "В разделе «Что купить» можно указать сумму вручную:\n"
         "<code>/what_to_buy 15000</code>"
@@ -352,6 +353,28 @@ async def cmd_what_to_buy(message: Message):
     await _send_plan(message, override)
 
 
+@dp.message(Command("analyze"))
+async def cmd_analyze(message: Message):
+    """AI-анализ портфеля через YandexGPT."""
+    if not is_enabled():
+        await message.answer(
+            "⚠️ AI-анализ не настроен.\n\n"
+            "Добавьте <code>YANDEX_API_KEY</code> и <code>YANDEX_FOLDER_ID</code> в .env",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer("🤔 Анализирую портфель… Это может занять несколько секунд.")
+
+    try:
+        snapshot = get_portfolio_snapshot()
+        analysis = analyze_portfolio(snapshot)
+        await message.answer(analysis)
+    except Exception as e:
+        logging.exception("Ошибка AI-анализа")
+        await message.answer(f"⚠️ Не удалось выполнить анализ: {e}")
+
+
 async def _send_plan(message: Message, override):
     try:
         snapshot = get_portfolio_snapshot()
@@ -403,6 +426,11 @@ async def msg_buy(message: Message):
         parse_mode="HTML",
         reply_markup=buy_menu_kb(),
     )
+
+
+@dp.message(F.text == "🤖 AI-анализ")
+async def msg_analyze(message: Message):
+    await cmd_analyze(message)
 
 
 @dp.message(F.text == "📖 Справка")
@@ -468,6 +496,31 @@ async def cb_structure(callback: CallbackQuery):
     await callback.message.edit_text(
         format_structure(snapshot),
         parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+
+
+@dp.callback_query(F.data == "analyze")
+async def cb_analyze(callback: CallbackQuery):
+    if not is_enabled():
+        await callback.answer("AI-анализ не настроен", show_alert=True)
+        return
+
+    await callback.answer("🤔 Анализирую…")
+    try:
+        snapshot = get_portfolio_snapshot()
+        analysis = analyze_portfolio(snapshot)
+    except Exception as e:
+        logging.exception("Ошибка AI-анализа")
+        await callback.message.edit_text(
+            f"⚠️ Ошибка AI-анализа: <code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
+        return
+
+    await callback.message.edit_text(
+        analysis,
         reply_markup=back_kb(),
     )
 
