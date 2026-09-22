@@ -2,6 +2,9 @@
 
 Приоритет: Валюта → Золото → Облигации → Акции.
 Внутри акций — волновой алгоритм по отстающим отраслям + финальный проход.
+
+Ключевое правило: покупаем минимальную компанию внутри минимальной отрасли,
+не обгоняя при этом ни следующую отрасль, ни следующую компанию внутри отрасли.
 """
 from collections import OrderedDict
 
@@ -144,7 +147,6 @@ def recommend_bonds(snapshot, budget):
     if gap <= 0 or budget <= 0:
         return None, budget
 
-    # Топ ОФЗ со всей биржи по YTM
     try:
         top_ofz = get_top_ofz(limit=3)
     except Exception:
@@ -155,7 +157,6 @@ def recommend_bonds(snapshot, budget):
         best = top_ofz[0]
         best_ytm = best["ytm"]
     else:
-        # Fallback — самая дешёвая из портфеля
         bonds = [p for p in snapshot["positions"] if p["type"] == "bond"]
         if not bonds:
             return None, budget
@@ -225,6 +226,7 @@ def _build_by_sector(positions):
 
 
 def _try_buy_one_lot(sector_data, budget):
+    """Для финального прохода: берёт минимальную компанию в отрасли и 1 лот."""
     companies = sorted(
         sector_data["positions"],
         key=lambda x: (x["value"], x["ticker"]),
@@ -240,7 +242,16 @@ def _try_buy_one_lot(sector_data, budget):
 
 
 def recommend_stocks(snapshot, budget, debug=False):
-    """Волновой алгоритм + финальный проход (оба — по 1 лоту)."""
+    """Волновой алгоритм + финальный проход.
+
+    Ключевые правила:
+    1. Покупаем в минимальной отрасли (из топ-5 отстающих).
+    2. Внутри отрасли — минимальную компанию.
+    3. Двойной лимит: не обогнать следующую отрасль И не обогнать
+       следующую компанию внутри отрасли.
+    4. Если лимит меньше цены лота, но хватает бюджета — покупаем 1 лот.
+    5. После каждой покупки пересчитываем — волнами, пока бюджет не исчерпан.
+    """
     if budget <= 0:
         return [], budget
 
@@ -255,7 +266,7 @@ def recommend_stocks(snapshot, budget, debug=False):
         by_sector = _build_by_sector(positions)
         sorted_sectors = sorted(by_sector.items(), key=lambda x: x[1]["value"])
 
-        if debug and iteration < 8:
+        if debug and iteration < 10:
             print(f"\n[DEBUG] Итерация {iteration+1}. Бюджет: {budget:.2f}₽")
             print(f"[DEBUG] Топ-5: {[(s, round(d['value'], 2)) for s, d in sorted_sectors[:5]]}")
 
@@ -263,58 +274,76 @@ def recommend_stocks(snapshot, budget, debug=False):
         for sector_name, sector_data in sorted_sectors[:5]:
             sector_value = sector_data["value"]
 
-            next_value = None
+            # Разрыв до следующей отрасли
+            next_sector_value = None
             for s_name, s_data in sorted_sectors:
                 if s_data["value"] > sector_value:
-                    next_value = s_data["value"]
+                    next_sector_value = s_data["value"]
                     break
 
-            if next_value is None:
+            if next_sector_value is None:
                 continue
 
-            sector_gap = next_value - sector_value
+            sector_gap = next_sector_value - sector_value
             if sector_gap <= 0:
                 continue
 
+            # Минимальная компания в отрасли
             companies = sorted(
                 sector_data["positions"],
                 key=lambda x: (x["value"], x["ticker"]),
             )
+            min_company = companies[0]
 
-            for company in companies:
-                price = company["price"]
-                lot = company["lot"]
-                lot_price = price * lot
-                if lot_price <= 0:
-                    continue
+            price = min_company["price"]
+            lot = min_company["lot"]
+            lot_price = price * lot
+            if lot_price <= 0 or lot_price > budget:
+                continue
 
-                n = calc_qty(sector_gap, lot_price, budget, max_overshoot=3.0)
+            # Разрыв до следующей компании внутри отрасли
+            if len(companies) > 1:
+                next_company_value = companies[1]["value"]
+                company_gap = next_company_value - min_company["value"]
+            else:
+                company_gap = float("inf")
 
-                if debug and iteration < 8:
-                    print(f"[DEBUG]   {sector_name}: {company['ticker']} "
-                          f"lot_price={lot_price:.2f} gap={sector_gap:.2f} N={n}")
+            # Если доли равны — покупаем 1 лот, чтобы задать волну
+            if company_gap <= 0:
+                company_gap = lot_price
 
-                if n == 0:
-                    continue
+            # Двойной лимит
+            effective_gap = min(sector_gap, company_gap)
 
-                qty = n * lot
-                amount = qty * price
+            n = calc_qty(effective_gap, lot_price, budget, max_overshoot=3.0)
 
-                recommendations.append({
-                    "category": "Акции", "sector": sector_name,
-                    "name": company["name"], "ticker": company["ticker"],
-                    "quantity": qty, "price": price, "amount": amount,
-                    "comment": f"{sector_name}: {company['name']}",
-                })
+            # Если не влезло ни по одному лимиту, но бюджет хватает — 1 лот
+            if n == 0 and lot_price <= budget:
+                n = 1
 
-                company["value"] += amount
-                company["quantity"] += qty
-                budget -= amount
-                bought = True
-                break
+            if debug and iteration < 10:
+                print(f"[DEBUG]   {sector_name}: {min_company['ticker']} "
+                      f"lot_price={lot_price:.2f} sector_gap={sector_gap:.2f} "
+                      f"company_gap={company_gap:.2f} → N={n}")
 
-            if bought:
-                break
+            if n == 0:
+                continue
+
+            qty = n * lot
+            amount = qty * price
+
+            recommendations.append({
+                "category": "Акции", "sector": sector_name,
+                "name": min_company["name"], "ticker": min_company["ticker"],
+                "quantity": qty, "price": price, "amount": amount,
+                "comment": f"{sector_name}: {min_company['name']}",
+            })
+
+            min_company["value"] += amount
+            min_company["quantity"] += qty
+            budget -= amount
+            bought = True
+            break
 
         if not bought:
             if debug:
