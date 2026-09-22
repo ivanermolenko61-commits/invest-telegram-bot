@@ -2,9 +2,7 @@
 
 Приоритет: Валюта → Золото → Облигации → Акции.
 Внутри акций — волновой алгоритм по отстающим отраслям + финальный проход.
-
-Ключевое правило: покупаем минимальную компанию внутри минимальной отрасли,
-не обгоняя при этом ни следующую отрасль, ни следующую компанию внутри отрасли.
+Внутри валюты — баланс USD ↔ CNY (по 2.5% на каждую).
 """
 from collections import OrderedDict
 
@@ -50,7 +48,7 @@ def find_position(snapshot, ticker):
     return next((p for p in snapshot["positions"] if p["ticker"] == ticker), None)
 
 
-def calc_qty(gap, lot_price, budget, max_overshoot=3.0):
+def calc_qty(gap, lot_price, budget, max_overshoot=1.0):
     if lot_price <= 0:
         return 0
     available = min(gap, budget)
@@ -74,41 +72,115 @@ def group_recommendations(recs):
 
 
 def recommend_currency(snapshot, budget):
+    """Добор валюты до 5%. Внутри — баланс USD ↔ CNY (2.5% на каждую).
+
+    Возвращает (список рекомендаций, остаток бюджета).
+    """
     cats = snapshot["categories"]
     total = snapshot["total_with_cash"]
-    gap = total * TARGETS["Валюта"] / 100 - cats["Валюта"]["value"]
 
-    if gap <= 0 or budget <= 0:
-        return None, budget
+    category_gap = total * TARGETS["Валюта"] / 100 - cats["Валюта"]["value"]
+    if category_gap <= 0 or budget <= 0:
+        return [], budget
+
+    # Целевая доля каждой валюты — 2.5%
+    target_per_currency = total * (TARGETS["Валюта"] / 2) / 100
 
     cny = find_position(snapshot, "CNYRUB_TOM_CETS")
     usd = find_position(snapshot, "USD000UTSTOM")
 
     if not cny and not usd:
-        return None, budget
+        return [], budget
 
-    cny_val = cny["value"] if cny else 0
-    usd_val = usd["value"] if usd else 0
+    cny_val = cny["value"] if cny else 0.0
+    usd_val = usd["value"] if usd else 0.0
+    cny_price = cny["price"] if cny else 0.0
+    usd_price = usd["price"] if usd else 0.0
+    cny_lot = cny["lot"] if cny else 1
+    usd_lot = usd["lot"] if usd else 1
 
-    if cny_val <= usd_val and cny:
-        ticker, name, price, lot = "CNYRUB_TOM_CETS", "Китайский юань", cny["price"], cny["lot"]
-    elif usd:
-        ticker, name, price, lot = "USD000UTSTOM", "Доллар США", usd["price"], usd["lot"]
-    else:
-        return None, budget
+    bought_cny = 0
+    bought_usd = 0
+    remaining = min(budget, category_gap)
 
-    lot_price = price * lot
-    n = calc_qty(gap, lot_price, budget, max_overshoot=5.0)
-    if n == 0:
-        return None, budget
+    for _ in range(2000):
+        if remaining <= 0:
+            break
 
-    qty = n * lot
-    amount = qty * price
-    return {
-        "category": "Валюта", "sector": None, "name": name, "ticker": ticker,
-        "quantity": qty, "price": price, "amount": amount,
-        "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
-    }, budget - amount
+        # Выбираем валюту: отстающую по доле
+        if cny_val < usd_val:
+            kind = "cny"
+        elif usd_val < cny_val:
+            kind = "usd"
+        else:
+            # Равны — берём ту, что не на цели
+            if cny_val < target_per_currency and cny_price > 0:
+                kind = "cny"
+            elif usd_val < target_per_currency and usd_price > 0:
+                kind = "usd"
+            else:
+                break
+
+        if kind == "cny":
+            price, lot, my_val, other_val = cny_price, cny_lot, cny_val, usd_val
+        else:
+            price, lot, my_val, other_val = usd_price, usd_lot, usd_val, cny_val
+
+        lot_price = price * lot
+        if lot_price <= 0 or lot_price > remaining:
+            break
+
+        # Лимит: не обогнать другую валюту
+        if other_val > my_val:
+            company_gap = other_val - my_val
+        else:
+            company_gap = lot_price
+
+        if company_gap < lot_price:
+            n_company = 1
+        else:
+            n_company = int(company_gap / lot_price)
+
+        n_remaining = int(remaining / lot_price)
+        n = min(n_company, n_remaining)
+        if n == 0:
+            n = 1
+
+        qty = n * lot
+        amount = qty * price
+
+        if amount > remaining:
+            break
+
+        if kind == "cny":
+            cny_val += amount
+            bought_cny += qty
+        else:
+            usd_val += amount
+            bought_usd += qty
+
+        remaining -= amount
+
+    result = []
+    if bought_cny > 0:
+        result.append({
+            "category": "Валюта", "sector": None,
+            "name": "Китайский юань", "ticker": "CNYRUB_TOM_CETS",
+            "quantity": bought_cny, "price": cny_price,
+            "amount": round(bought_cny * cny_price, 2),
+            "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
+        })
+    if bought_usd > 0:
+        result.append({
+            "category": "Валюта", "sector": None,
+            "name": "Доллар США", "ticker": "USD000UTSTOM",
+            "quantity": bought_usd, "price": usd_price,
+            "amount": round(bought_usd * usd_price, 2),
+            "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
+        })
+
+    spent = sum(r["amount"] for r in result)
+    return result, budget - spent
 
 
 def recommend_gold(snapshot, budget):
@@ -139,7 +211,6 @@ def recommend_gold(snapshot, budget):
 
 
 def recommend_bonds(snapshot, budget):
-    """Добор облигаций до 15%. Берём самую доходную ОФЗ со всей биржи (топ по YTM)."""
     cats = snapshot["categories"]
     total = snapshot["total_with_cash"]
     gap = total * TARGETS["Облигации"] / 100 - cats["Облигации"]["value"]
@@ -226,7 +297,6 @@ def _build_by_sector(positions):
 
 
 def _try_buy_one_lot(sector_data, budget):
-    """Для финального прохода: берёт минимальную компанию в отрасли и 1 лот."""
     companies = sorted(
         sector_data["positions"],
         key=lambda x: (x["value"], x["ticker"]),
@@ -242,16 +312,7 @@ def _try_buy_one_lot(sector_data, budget):
 
 
 def recommend_stocks(snapshot, budget, debug=False):
-    """Волновой алгоритм + финальный проход.
-
-    Ключевые правила:
-    1. Покупаем в минимальной отрасли (из топ-5 отстающих).
-    2. Внутри отрасли — минимальную компанию.
-    3. Двойной лимит: не обогнать следующую отрасль И не обогнать
-       следующую компанию внутри отрасли.
-    4. Если лимит меньше цены лота, но хватает бюджета — покупаем 1 лот.
-    5. После каждой покупки пересчитываем — волнами, пока бюджет не исчерпан.
-    """
+    """Волновой алгоритм с «пинг-понгом» внутри отрасли."""
     if budget <= 0:
         return [], budget
 
@@ -274,7 +335,6 @@ def recommend_stocks(snapshot, budget, debug=False):
         for sector_name, sector_data in sorted_sectors[:5]:
             sector_value = sector_data["value"]
 
-            # Разрыв до следующей отрасли
             next_sector_value = None
             for s_name, s_data in sorted_sectors:
                 if s_data["value"] > sector_value:
@@ -288,7 +348,6 @@ def recommend_stocks(snapshot, budget, debug=False):
             if sector_gap <= 0:
                 continue
 
-            # Минимальная компания в отрасли
             companies = sorted(
                 sector_data["positions"],
                 key=lambda x: (x["value"], x["ticker"]),
@@ -301,25 +360,17 @@ def recommend_stocks(snapshot, budget, debug=False):
             if lot_price <= 0 or lot_price > budget:
                 continue
 
-            # Разрыв до следующей компании внутри отрасли
             if len(companies) > 1:
-                next_company_value = companies[1]["value"]
-                company_gap = next_company_value - min_company["value"]
+                company_gap = companies[1]["value"] - min_company["value"]
             else:
                 company_gap = float("inf")
 
-            # Если доли равны — покупаем 1 лот, чтобы задать волну
             if company_gap <= 0:
                 company_gap = lot_price
 
-            # Двойной лимит
             effective_gap = min(sector_gap, company_gap)
 
             n = calc_qty(effective_gap, lot_price, budget, max_overshoot=3.0)
-
-            # Если не влезло ни по одному лимиту, но бюджет хватает — 1 лот
-            if n == 0 and lot_price <= budget:
-                n = 1
 
             if debug and iteration < 10:
                 print(f"[DEBUG]   {sector_name}: {min_company['ticker']} "
@@ -404,11 +455,13 @@ def recommend(snapshot, override_budget=None, debug=False):
 
     recommendations = []
 
-    rec, budget = recommend_currency(snapshot, budget)
-    if rec:
-        recommendations.append(rec)
+    # Валюта — возвращает список
+    currency_recs, budget = recommend_currency(snapshot, budget)
+    if currency_recs:
+        recommendations.extend(currency_recs)
         if debug:
-            print(f"[DEBUG] Валюта: {rec['quantity']} за {rec['amount']:.2f}₽")
+            for r in currency_recs:
+                print(f"[DEBUG] Валюта: {r['name']} {r['quantity']} за {r['amount']:.2f}₽")
 
     rec, budget = recommend_gold(snapshot, budget)
     if rec:
