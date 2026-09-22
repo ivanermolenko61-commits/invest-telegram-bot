@@ -102,7 +102,7 @@ def get_share_info(tickers):
 # ---------- Подбор лучших ОФЗ со всей биржи ----------
 
 _OFZ_CACHE_FILE = "ofz_cache.json"
-_OFZ_CACHE_TTL = 3600  # секунд
+_OFZ_CACHE_TTL = 1800  # секунд
 _OFZ_CACHE = {"data": None, "ts": 0}
 
 
