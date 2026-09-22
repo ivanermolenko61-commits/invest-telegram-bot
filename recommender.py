@@ -49,13 +49,17 @@ def find_position(snapshot, ticker):
 
 
 def calc_qty(gap, lot_price, budget, max_overshoot=1.0):
+    """Сколько лотов купить.
+
+    Ключевое правило: если gap > 0 и хватает денег на лот — покупаем хотя бы 1.
+    Даже если gap крошечный (0.01%) — это не ноль, значит баланс не достигнут.
+    """
     if lot_price <= 0:
         return 0
     available = min(gap, budget)
     n = int(available / lot_price)
     if n == 0 and gap > 0 and budget >= lot_price:
-        if lot_price <= gap * max_overshoot:
-            n = 1
+        n = 1
     return n
 
 
@@ -72,10 +76,7 @@ def group_recommendations(recs):
 
 
 def recommend_currency(snapshot, budget):
-    """Добор валюты до 5%. Внутри — баланс USD ↔ CNY (2.5% на каждую).
-
-    Возвращает (список рекомендаций, остаток бюджета).
-    """
+    """Добор валюты до 5%. Внутри — баланс USD ↔ CNY (2.5% на каждую)."""
     cats = snapshot["categories"]
     total = snapshot["total_with_cash"]
 
@@ -83,7 +84,6 @@ def recommend_currency(snapshot, budget):
     if category_gap <= 0 or budget <= 0:
         return [], budget
 
-    # Целевая доля каждой валюты — 2.5%
     target_per_currency = total * (TARGETS["Валюта"] / 2) / 100
 
     cny = find_position(snapshot, "CNYRUB_TOM_CETS")
@@ -107,13 +107,11 @@ def recommend_currency(snapshot, budget):
         if remaining <= 0:
             break
 
-        # Выбираем валюту: отстающую по доле
         if cny_val < usd_val:
             kind = "cny"
         elif usd_val < cny_val:
             kind = "usd"
         else:
-            # Равны — берём ту, что не на цели
             if cny_val < target_per_currency and cny_price > 0:
                 kind = "cny"
             elif usd_val < target_per_currency and usd_price > 0:
@@ -130,7 +128,6 @@ def recommend_currency(snapshot, budget):
         if lot_price <= 0 or lot_price > remaining:
             break
 
-        # Лимит: не обогнать другую валюту
         if other_val > my_val:
             company_gap = other_val - my_val
         else:
@@ -197,7 +194,7 @@ def recommend_gold(snapshot, budget):
 
     price, lot = pos["price"], pos["lot"]
     lot_price = price * lot
-    n = calc_qty(gap, lot_price, budget, max_overshoot=5.0)
+    n = calc_qty(gap, lot_price, budget)
     if n == 0:
         return None, budget
 
@@ -237,7 +234,7 @@ def recommend_bonds(snapshot, budget):
     lot = best["lot"]
     lot_price = price * lot
 
-    n = calc_qty(gap, lot_price, budget, max_overshoot=1.5)
+    n = calc_qty(gap, lot_price, budget)
     if n == 0:
         return None, budget
 
@@ -312,7 +309,7 @@ def _try_buy_one_lot(sector_data, budget):
 
 
 def recommend_stocks(snapshot, budget, debug=False):
-    """Волновой алгоритм с «пинг-понгом» внутри отрасли."""
+    """Волновой алгоритм по отстающим отраслям + финальный проход."""
     if budget <= 0:
         return [], budget
 
@@ -320,7 +317,7 @@ def recommend_stocks(snapshot, budget, debug=False):
     recommendations = []
 
     # ========== ОСНОВНОЙ ЦИКЛ ==========
-    for iteration in range(1000):
+    for iteration in range(10000):
         if budget <= 0:
             break
 
@@ -368,9 +365,14 @@ def recommend_stocks(snapshot, budget, debug=False):
             if company_gap <= 0:
                 company_gap = lot_price
 
-            effective_gap = min(sector_gap, company_gap)
+            # Не даём company_gap схлопнуть покупку:
+            # если внутри отрасли перекос минимальный — ограничиваем только по отрасли
+            if company_gap < lot_price:
+                effective_gap = sector_gap
+            else:
+                effective_gap = min(sector_gap, company_gap)
 
-            n = calc_qty(effective_gap, lot_price, budget, max_overshoot=3.0)
+            n = calc_qty(effective_gap, lot_price, budget)
 
             if debug and iteration < 10:
                 print(f"[DEBUG]   {sector_name}: {min_company['ticker']} "
@@ -402,7 +404,7 @@ def recommend_stocks(snapshot, budget, debug=False):
             break
 
     # ========== ФИНАЛЬНЫЙ ПРОХОД ==========
-    for iteration in range(1000):
+    for iteration in range(10000):
         if budget <= 0:
             break
 
@@ -455,7 +457,6 @@ def recommend(snapshot, override_budget=None, debug=False):
 
     recommendations = []
 
-    # Валюта — возвращает список
     currency_recs, budget = recommend_currency(snapshot, budget)
     if currency_recs:
         recommendations.extend(currency_recs)
