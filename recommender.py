@@ -1,7 +1,7 @@
 """Логика рекомендаций покупок.
 
 Приоритет: Валюта → Золото → Облигации → Акции.
-Внутри акций — волновой алгоритм по 3 самым отстающим отраслям.
+Внутри акций — волновой алгоритм по отстающим отраслям + финальный проход.
 """
 from collections import OrderedDict
 
@@ -10,33 +10,54 @@ from tinkoff_api import (
     get_share_info,
     SECTOR_BY_TICKER,
     NAME_BY_TICKER,
-    WISHLIST_TICKERS,
 )
 
 
 TARGETS = {"Валюта": 5.0, "Золото": 10.0, "Облигации": 15.0, "Акции": 70.0}
+
+BUY_LIST = [
+    "ASTR", "CNRU", "YDEX", "HEAD",
+    "NLMK", "ALRS", "RUAL", "MAGN", "CHMF", "PLZL", "GMKN",
+    "PRMD", "MDMG", "OZPH",
+    "SIBN", "ROSN", "GAZP", "NVTK", "LKOH",
+    "SBERP", "T", "VTBR", "MOEX",
+    "X5", "MGNT", "RAGR",
+    "MTSS", "RTKM",
+    "AFLT", "FLOT",
+    "IRAO", "HYDR", "UPRO",
+]
+
+
+def _adjust_snapshot_for_budget(snapshot, effective_free_cash):
+    snap = dict(snapshot)
+    total = snapshot["total_value"] + effective_free_cash
+    snap["total_with_cash"] = total
+
+    new_cats = {}
+    for k, v in snapshot["categories"].items():
+        pct = v["value"] / total * 100 if total else 0
+        new_cats[k] = {"value": v["value"], "percent": round(pct, 2)}
+    snap["categories"] = new_cats
+
+    return snap
 
 
 def find_position(snapshot, ticker):
     return next((p for p in snapshot["positions"] if p["ticker"] == ticker), None)
 
 
-def calc_qty(gap, lot_price, budget):
-    """Сколько лотов влезает в gap, но не больше бюджета.
-
-    Если в gap не влезает ни одного лота, но в бюджет влезает — берём 1 лот.
-    """
+def calc_qty(gap, lot_price, budget, max_overshoot=3.0):
     if lot_price <= 0:
         return 0
     available = min(gap, budget)
     n = int(available / lot_price)
     if n == 0 and gap > 0 and budget >= lot_price:
-        n = 1
+        if lot_price <= gap * max_overshoot:
+            n = 1
     return n
 
 
 def group_recommendations(recs):
-    """Схлопывает рекомендации по одному тикеру в одну строку."""
     grouped = OrderedDict()
     for r in recs:
         key = r["ticker"]
@@ -50,7 +71,7 @@ def group_recommendations(recs):
 
 def recommend_currency(snapshot, budget):
     cats = snapshot["categories"]
-    total = snapshot["total_value"]
+    total = snapshot["total_with_cash"]
     gap = total * TARGETS["Валюта"] / 100 - cats["Валюта"]["value"]
 
     if gap <= 0 or budget <= 0:
@@ -59,36 +80,36 @@ def recommend_currency(snapshot, budget):
     cny = find_position(snapshot, "CNYRUB_TOM_CETS")
     usd = find_position(snapshot, "USD000UTSTOM")
 
+    if not cny and not usd:
+        return None, budget
+
     cny_val = cny["value"] if cny else 0
     usd_val = usd["value"] if usd else 0
 
-    if cny_val < usd_val:
-        ticker, name, price, lot = "CNYRUB_TOM_CETS", "Китайский юань", 12.49, 1
+    if cny_val <= usd_val and cny:
+        ticker, name, price, lot = "CNYRUB_TOM_CETS", "Китайский юань", cny["price"], cny["lot"]
+    elif usd:
+        ticker, name, price, lot = "USD000UTSTOM", "Доллар США", usd["price"], usd["lot"]
     else:
-        ticker, name, price, lot = "USD000UTSTOM", "Доллар США", 84.10, 1
+        return None, budget
 
     lot_price = price * lot
-    n = calc_qty(gap, lot_price, budget)
+    n = calc_qty(gap, lot_price, budget, max_overshoot=5.0)
     if n == 0:
         return None, budget
 
     qty = n * lot
     amount = qty * price
     return {
-        "category": "Валюта",
-        "sector": None,
-        "name": name,
-        "ticker": ticker,
-        "quantity": qty,
-        "price": price,
-        "amount": amount,
+        "category": "Валюта", "sector": None, "name": name, "ticker": ticker,
+        "quantity": qty, "price": price, "amount": amount,
         "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
     }, budget - amount
 
 
 def recommend_gold(snapshot, budget):
     cats = snapshot["categories"]
-    total = snapshot["total_value"]
+    total = snapshot["total_with_cash"]
     gap = total * TARGETS["Золото"] / 100 - cats["Золото"]["value"]
 
     if gap <= 0 or budget <= 0:
@@ -98,30 +119,24 @@ def recommend_gold(snapshot, budget):
     if not pos:
         return None, budget
 
-    price = pos["price"]
-    lot = pos["lot"]
+    price, lot = pos["price"], pos["lot"]
     lot_price = price * lot
-    n = calc_qty(gap, lot_price, budget)
+    n = calc_qty(gap, lot_price, budget, max_overshoot=5.0)
     if n == 0:
         return None, budget
 
     qty = n * lot
     amount = qty * price
     return {
-        "category": "Золото",
-        "sector": None,
-        "name": "Альфа-Капитал Золото",
-        "ticker": "AKGD",
-        "quantity": qty,
-        "price": price,
-        "amount": amount,
+        "category": "Золото", "sector": None, "name": "Альфа-Капитал Золото", "ticker": "AKGD",
+        "quantity": qty, "price": price, "amount": amount,
         "comment": f"Золото {cats['Золото']['percent']:.2f}% → цель {TARGETS['Золото']}%",
     }, budget - amount
 
 
 def recommend_bonds(snapshot, budget):
     cats = snapshot["categories"]
-    total = snapshot["total_value"]
+    total = snapshot["total_with_cash"]
     gap = total * TARGETS["Облигации"] / 100 - cats["Облигации"]["value"]
 
     if gap <= 0 or budget <= 0:
@@ -132,69 +147,103 @@ def recommend_bonds(snapshot, budget):
         return None, budget
 
     cheapest = min(bonds, key=lambda b: b["price"] * b["lot"])
-    price = cheapest["price"]
-    lot = cheapest["lot"]
+    price, lot = cheapest["price"], cheapest["lot"]
     lot_price = price * lot
 
-    n = calc_qty(gap, lot_price, budget)
+    n = calc_qty(gap, lot_price, budget, max_overshoot=1.5)
     if n == 0:
         return None, budget
 
     qty = n * lot
     amount = qty * price
     return {
-        "category": "Облигации",
-        "sector": None,
+        "category": "Облигации", "sector": None,
         "name": NAME_BY_TICKER.get(cheapest["ticker"], cheapest["name"]),
         "ticker": cheapest["ticker"],
-        "quantity": qty,
-        "price": price,
-        "amount": amount,
+        "quantity": qty, "price": price, "amount": amount,
         "comment": f"Облигации {cats['Облигации']['percent']:.2f}% → цель {TARGETS['Облигации']}%",
     }, budget - amount
 
 
-def recommend_stocks(snapshot, budget):
-    """Волновой алгоритм по 3 самым отстающим отраслям."""
+def _prepare_positions(snapshot, debug=False):
+    positions = [dict(p) for p in snapshot["positions"] if p["type"] == "share"]
+    existing = {p["ticker"] for p in positions}
+    missing = [t for t in BUY_LIST if t not in existing]
+
+    if debug:
+        print(f"\n[DEBUG] Портфельных акций: {len(positions)}")
+        print(f"[DEBUG] Запрашиваем через API: {missing}")
+
+    if missing:
+        infos = get_share_info(missing)
+        if debug:
+            print(f"[DEBUG] API вернул: {sorted(infos.keys())}")
+
+        for ticker, info in infos.items():
+            if info["price"] <= 0:
+                continue
+            positions.append({
+                "ticker": ticker, "name": info["name"], "type": "share",
+                "sector": SECTOR_BY_TICKER.get(ticker, "Прочее"),
+                "quantity": 0.0, "price": info["price"],
+                "value": 0.0, "lot": info["lot"],
+            })
+
+    return positions
+
+
+def _build_by_sector(positions):
+    by_sector = {}
+    for p in positions:
+        s = p["sector"]
+        by_sector.setdefault(s, {"value": 0.0, "positions": []})
+        by_sector[s]["value"] += p["value"]
+        by_sector[s]["positions"].append(p)
+    return by_sector
+
+
+def _try_buy_one_lot(sector_data, budget):
+    """Пытается купить 1 лот в самой отстающей компании отрасли.
+
+    Возвращает (рекомендация, потрачено) или (None, 0), если ничего не купить.
+    """
+    companies = sorted(
+        sector_data["positions"],
+        key=lambda x: (x["value"], x["ticker"]),
+    )
+    for company in companies:
+        price = company["price"]
+        lot = company["lot"]
+        lot_price = price * lot
+        if lot_price <= 0 or lot_price > budget:
+            continue
+
+        return company, lot, lot_price
+    return None, 0, 0
+
+
+def recommend_stocks(snapshot, budget, debug=False):
+    """Волновой алгоритм + финальный проход (оба — по 1 лоту за раз)."""
     if budget <= 0:
         return [], budget
 
-    positions = [dict(p) for p in snapshot["positions"] if p["type"] == "share"]
-
-    existing = {p["ticker"] for p in positions}
-    missing = [t for t in WISHLIST_TICKERS if t not in existing]
-    if missing:
-        infos = get_share_info(missing)
-        for ticker, info in infos.items():
-            positions.append({
-                "ticker": ticker,
-                "name": info["name"],
-                "type": "share",
-                "sector": SECTOR_BY_TICKER.get(ticker, "Прочее"),
-                "quantity": 0.0,
-                "price": info["price"],
-                "value": 0.0,
-                "lot": info["lot"],
-            })
-
+    positions = _prepare_positions(snapshot, debug=debug)
     recommendations = []
 
-    for _ in range(500):
+    # ========== ОСНОВНОЙ ЦИКЛ: учёт gap до следующей отрасли ==========
+    for iteration in range(1000):
         if budget <= 0:
             break
 
-        by_sector = {}
-        for p in positions:
-            s = p["sector"]
-            by_sector.setdefault(s, {"value": 0.0, "positions": []})
-            by_sector[s]["value"] += p["value"]
-            by_sector[s]["positions"].append(p)
-
+        by_sector = _build_by_sector(positions)
         sorted_sectors = sorted(by_sector.items(), key=lambda x: x[1]["value"])
-        top3 = sorted_sectors[:3]
+
+        if debug and iteration < 8:
+            print(f"\n[DEBUG] Итерация {iteration+1}. Бюджет: {budget:.2f}₽")
+            print(f"[DEBUG] Топ-5: {[(s, round(d['value'], 2)) for s, d in sorted_sectors[:5]]}")
 
         bought = False
-        for sector_name, sector_data in top3:
+        for sector_name, sector_data in sorted_sectors[:5]:
             sector_value = sector_data["value"]
 
             next_value = None
@@ -203,54 +252,110 @@ def recommend_stocks(snapshot, budget):
                     next_value = s_data["value"]
                     break
 
-            sector_gap = (next_value - sector_value) if next_value else float("inf")
+            if next_value is None:
+                continue
+
+            sector_gap = next_value - sector_value
             if sector_gap <= 0:
                 continue
 
-            companies = sorted(sector_data["positions"], key=lambda x: x["value"])
-            min_company = companies[0]
+            companies = sorted(
+                sector_data["positions"],
+                key=lambda x: (x["value"], x["ticker"]),
+            )
 
-            price = min_company["price"]
-            lot = min_company["lot"]
-            lot_price = price * lot
-            if lot_price <= 0:
+            for company in companies:
+                price = company["price"]
+                lot = company["lot"]
+                lot_price = price * lot
+                if lot_price <= 0:
+                    continue
+
+                n = calc_qty(sector_gap, lot_price, budget, max_overshoot=3.0)
+
+                if debug and iteration < 8:
+                    print(f"[DEBUG]   {sector_name}: {company['ticker']} "
+                          f"lot_price={lot_price:.2f} gap={sector_gap:.2f} N={n}")
+
+                if n == 0:
+                    continue
+
+                qty = n * lot
+                amount = qty * price
+
+                recommendations.append({
+                    "category": "Акции", "sector": sector_name,
+                    "name": company["name"], "ticker": company["ticker"],
+                    "quantity": qty, "price": price, "amount": amount,
+                    "comment": f"{sector_name}: {company['name']}",
+                })
+
+                company["value"] += amount
+                company["quantity"] += qty
+                budget -= amount
+                bought = True
+                break
+
+            if bought:
+                break
+
+        if not bought:
+            if debug:
+                print(f"\n[DEBUG] Основной цикл завершён. Остаток: {budget:.2f}₽")
+            break
+
+    # ========== ФИНАЛЬНЫЙ ПРОХОД: по 1 лоту, БЕЗ gap, волнами ==========
+    # Покупаем в самой отстающей отрасли самую отстающую компанию,
+    # по ОДНОМУ лоту за раз, с пересчётом после каждой покупки.
+    for iteration in range(1000):
+        if budget <= 0:
+            break
+
+        by_sector = _build_by_sector(positions)
+        sorted_sectors = sorted(by_sector.items(), key=lambda x: x[1]["value"])
+
+        bought = False
+        for sector_name, sector_data in sorted_sectors[:5]:
+            company, lot, lot_price = _try_buy_one_lot(sector_data, budget)
+
+            if company is None:
                 continue
 
-            n = calc_qty(sector_gap, lot_price, budget)
-            if n == 0:
-                continue
-
-            qty = n * lot
-            amount = qty * price
+            price = company["price"]
+            qty = lot
+            amount = lot_price
 
             recommendations.append({
-                "category": "Акции",
-                "sector": sector_name,
-                "name": min_company["name"],
-                "ticker": min_company["ticker"],
-                "quantity": qty,
-                "price": price,
-                "amount": amount,
-                "comment": f"{sector_name}: {min_company['name']}",
+                "category": "Акции", "sector": sector_name,
+                "name": company["name"], "ticker": company["ticker"],
+                "quantity": qty, "price": price, "amount": amount,
+                "comment": f"{sector_name}: {company['name']} (добор)",
             })
 
-            min_company["value"] += amount
-            min_company["quantity"] += qty
-            sector_data["value"] += amount
+            if debug and iteration < 10:
+                print(f"[DEBUG] Финальный {iteration+1}: {company['ticker']} "
+                      f"{qty} шт за {amount:.2f}₽ (бюджет → {budget - amount:.2f}₽)")
 
+            company["value"] += amount
+            company["quantity"] += qty
             budget -= amount
             bought = True
             break
 
         if not bought:
+            if debug:
+                print(f"\n[DEBUG] Финальный проход: больше нечего купить. Остаток: {budget:.2f}₽")
             break
 
     return recommendations, budget
 
 
-def recommend(snapshot, override_budget=None):
-    """Собирает полный план покупок (сгруппированный по тикерам)."""
+def recommend(snapshot, override_budget=None, debug=False):
     budget = override_budget if override_budget is not None else snapshot["free_cash_rub"]
+
+    if override_budget is not None:
+        snapshot = _adjust_snapshot_for_budget(snapshot, override_budget)
+
     if budget <= 0:
         return []
 
@@ -259,16 +364,22 @@ def recommend(snapshot, override_budget=None):
     rec, budget = recommend_currency(snapshot, budget)
     if rec:
         recommendations.append(rec)
+        if debug:
+            print(f"[DEBUG] Валюта: {rec['quantity']} за {rec['amount']:.2f}₽")
 
     rec, budget = recommend_gold(snapshot, budget)
     if rec:
         recommendations.append(rec)
+        if debug:
+            print(f"[DEBUG] Золото: {rec['quantity']} за {rec['amount']:.2f}₽")
 
     rec, budget = recommend_bonds(snapshot, budget)
     if rec:
         recommendations.append(rec)
+        if debug:
+            print(f"[DEBUG] Облигации: {rec['name']} {rec['quantity']} за {rec['amount']:.2f}₽")
 
-    stock_recs, budget = recommend_stocks(snapshot, budget)
+    stock_recs, budget = recommend_stocks(snapshot, budget, debug=debug)
     recommendations.extend(stock_recs)
 
     return group_recommendations(recommendations)
@@ -279,15 +390,21 @@ if __name__ == "__main__":
 
     snap = get_portfolio_snapshot()
 
-    if len(sys.argv) > 1:
-        budget = float(sys.argv[1])
-        print(f"⚠️  Тестовый бюджет: {budget:,.2f} ₽\n")
+    debug = "--debug" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--debug"]
+
+    if args:
+        budget = float(args[0])
+        print(f"⚠️  Тестовый бюджет: {budget:,.2f} ₽")
     else:
         budget = snap["free_cash_rub"]
 
-    recs = recommend(snap, override_budget=budget)
+    if debug:
+        print("🔍 DEBUG включён\n")
 
-    print(f"💰 Свободно: {budget:,.2f} ₽\n")
+    recs = recommend(snap, override_budget=budget if args else None, debug=debug)
+
+    print(f"\n💰 Свободно: {budget:,.2f} ₽\n")
     if not recs:
         print("✅ Рекомендаций нет")
     else:

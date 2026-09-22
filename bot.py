@@ -30,6 +30,7 @@ scheduler = AsyncIOScheduler()
 # ---------- Форматирование ----------
 
 def format_portfolio(snapshot):
+    """Краткая сводка: топ-10 акций + итоги."""
     positions = [p for p in snapshot["positions"] if p["type"] == "share"]
     positions.sort(key=lambda p: p["value"], reverse=True)
 
@@ -60,6 +61,7 @@ def format_portfolio(snapshot):
 
 
 def format_structure(snapshot):
+    """Структура по категориям и отраслям."""
     lines = ["⚖️ <b>Структура портфеля</b>\n"]
 
     cats = snapshot["categories"]
@@ -84,30 +86,41 @@ def format_structure(snapshot):
     return "\n".join(lines)
 
 
-def format_plan(snapshot, recs):
-    """Форматирует план покупок."""
+def format_plan(recs, budget):
+    """Форматирует план покупок с группировкой по категориям."""
     if not recs:
         return (
-            "✅ <b>Рекомендаций нет</b>\n\n"
-            f"Свободно: {snapshot['free_cash_rub']:,.2f} ₽\n"
-            "Либо всё на цели, либо не хватает на минимальную покупку."
+            "✅ <b>Рекомендаций нет.</b>\n\n"
+            "Либо всё на цели, либо свободных денег нет на минимальный лот."
         )
 
-    lines = [f"🎯 <b>План покупок на {snapshot['free_cash_rub']:,.2f} ₽</b>\n"]
+    by_cat = {}
+    for r in recs:
+        by_cat.setdefault(r["category"], []).append(r)
 
-    total = 0
-    for i, r in enumerate(recs, 1):
-        lines.append(
-            f"{i}. [{r['category']}] <b>{r['name']}</b>\n"
-            f"   {r['quantity']:.0f} шт × {r['price']:.2f} ₽ = "
-            f"{r['amount']:,.2f} ₽\n"
-            f"   <i>{r['comment']}</i>"
-        )
-        total += r["amount"]
+    lines = [f"📋 <b>План покупок на {budget:,.0f} ₽</b>"]
 
-    lines.append(f"\n💰 <b>Итого:</b> {total:,.2f} ₽")
-    lines.append(f"💵 <b>Остаток:</b> {snapshot['free_cash_rub'] - total:,.2f} ₽")
-    lines.append("\n<i>Проверяйте актуальные цены перед покупкой.</i>")
+    order = ["Валюта", "Золото", "Облигации", "Акции"]
+    emoji = {"Валюта": "💵", "Золото": "🥇", "Облигации": "📜", "Акции": "📈"}
+
+    total_plan = 0
+    for cat in order:
+        items = by_cat.get(cat)
+        if not items:
+            continue
+
+        cat_sum = sum(r["amount"] for r in items)
+        lines.append(f"\n{emoji[cat]} <b>{cat}</b> ({cat_sum:,.0f} ₽)")
+
+        for r in items:
+            lines.append(
+                f"   • {r['comment']} — {r['quantity']:.0f} шт × "
+                f"{r['price']:.2f} ₽ = <b>{r['amount']:,.0f} ₽</b>"
+            )
+            total_plan += r["amount"]
+
+    lines.append(f"\n💰 <b>Итого:</b> {total_plan:,.2f} ₽ из {budget:,.2f} ₽")
+    lines.append(f"💵 <b>Остаток:</b> {budget - total_plan:,.2f} ₽")
 
     return "\n".join(lines)
 
@@ -122,7 +135,7 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/portfolio — топ-10 позиций\n"
         "/structure — структура по категориям\n"
-        "/what_to_buy — план покупок на свободные деньги\n"
+        "/what_to_buy — план покупок\n"
         "/help — справка",
         parse_mode="HTML",
     )
@@ -139,7 +152,8 @@ async def cmd_help(message: Message):
         "/help — эта справка\n"
         "/portfolio — топ-10 позиций\n"
         "/structure — категории и отрасли\n"
-        "/what_to_buy — что купить на свободные средства",
+        "/what_to_buy — план покупок на свободные деньги\n"
+        "/what_to_buy 15000 — виртуальный бюджет для теста",
         parse_mode="HTML",
     )
 
@@ -167,7 +181,10 @@ async def cmd_structure(message: Message):
         snapshot = get_portfolio_snapshot()
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
-        await message.answer(f"⚠️ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        await message.answer(
+            f"⚠️ Ошибка: <code>{e}</code>",
+            parse_mode="HTML",
+        )
         return
 
     await message.answer(format_structure(snapshot), parse_mode="HTML")
@@ -175,16 +192,49 @@ async def cmd_structure(message: Message):
 
 @dp.message(Command("what_to_buy"))
 async def cmd_what_to_buy(message: Message):
-    await message.answer("⏳ Считаю рекомендации…")
+    # Парсим аргумент (виртуальный бюджет)
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+
+    override = None
+    if len(parts) > 1:
+        raw = parts[1].strip().replace(" ", "").replace(",", ".")
+        try:
+            override = float(raw)
+        except ValueError:
+            await message.answer(
+                f"⚠️ Не понял бюджет: <code>{parts[1]}</code>\n"
+                f"Пример: <code>/what_to_buy 15000</code>",
+                parse_mode="HTML",
+            )
+            return
+
+    await message.answer("⏳ Считаю план покупок…")
+
     try:
         snapshot = get_portfolio_snapshot()
-        recs = recommend(snapshot)
+        budget = override if override is not None else snapshot["free_cash_rub"]
+
+        if budget <= 0:
+            await message.answer(
+                "💵 <b>Свободных денег нет.</b>\n\n"
+                "Пополните счёт или запустите с тестовым бюджетом:\n"
+                "<code>/what_to_buy 15000</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        recs = recommend(snapshot, override_budget=budget)
+
     except Exception as e:
-        logging.exception("Ошибка рекомендаций")
-        await message.answer(f"⚠️ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        logging.exception("Ошибка при расчёте плана")
+        await message.answer(
+            f"⚠️ Не удалось рассчитать план.\n\n<code>{e}</code>",
+            parse_mode="HTML",
+        )
         return
 
-    await message.answer(format_plan(snapshot, recs), parse_mode="HTML")
+    await message.answer(format_plan(recs, budget), parse_mode="HTML")
 
 
 # ---------- Планировщик ----------

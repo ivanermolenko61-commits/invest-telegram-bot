@@ -30,7 +30,7 @@ SECTOR_BY_TICKER = {
     "YDEX": "IT",
     "ASTR": "IT",
     "HEAD": "IT",
-    "CNRU": "IT",      # ← было CIAN, стало CNRU
+    "CNRU": "IT",
     "AFLT": "Машиностроение и транспорт",
     "FLOT": "Машиностроение и транспорт",
     "MTSS": "Телекоммуникации",
@@ -53,13 +53,15 @@ NAME_BY_TICKER = {
     "SBERP": "Сбербанк (прив.)", "SBER": "Сбербанк", "T": "Т-Технологии",
     "VTBR": "ВТБ", "MOEX": "Московская Биржа",
     "YDEX": "Яндекс", "ASTR": "Группа Астра", "HEAD": "Хадхантер",
-    "CNRU": "Циан",     # ← было CIAN, стало CNRU
+    "CNRU": "Циан",
     "AFLT": "Аэрофлот", "FLOT": "Совкомфлот",
     "MTSS": "МТС", "RTKM": "Ростелеком",
     "PRMD": "Промомед", "MDMG": "Мать и дитя", "OZPH": "Озон Фармацевтика",
     "SIBN": "Газпром нефть", "ROSN": "Роснефть", "GAZP": "Газпром",
     "NVTK": "НОВАТЭК", "LKOH": "ЛУКОЙЛ",
     "AKGD": "Альфа-Капитал Золото",
+    "SU26248RMFS3": "ОФЗ 26248", "SU26254RMFS1": "ОФЗ 26254",
+    "CNYRUB_TOM_CETS": "Китайский юань", "USD000UTSTOM": "Доллар США",
 }
 
 IGNORED_TICKERS = {"TECH", "TECH2", "TSPX", "TSPX2", "RUB000UTSTOM"}
@@ -81,10 +83,12 @@ WISHLIST_TICKERS = ["ASTR", "CNRU"]
 
 
 def money_to_float(money):
+    """MoneyValue из API → float."""
     return money.units + money.nano / 1e9
 
 
 def get_main_account_id(client):
+    """Возвращает ID брокерского счёта (type=1)."""
     accounts = client.users.get_accounts().accounts
     main = next((a for a in accounts if a.type == 1), None)
     if not main:
@@ -119,7 +123,18 @@ def get_share_info(tickers):
 
 
 def get_portfolio_snapshot():
-    """Снимок портфеля в удобной структуре."""
+    """Снимок портфеля в удобной структуре.
+
+    Возвращает словарь:
+        {
+            "total_value": float,           # стоимость активов
+            "free_cash_rub": float,         # свободные рубли
+            "total_with_cash": float,       # активы + свободные (полный портфель)
+            "categories": {...},
+            "positions": [...],
+            "by_sector": {...},
+        }
+    """
     with Client(TOKEN) as client:
         account_id = get_main_account_id(client)
         portfolio = client.operations.get_portfolio(account_id=account_id)
@@ -157,6 +172,8 @@ def get_portfolio_snapshot():
             })
 
         total_value = money_to_float(portfolio.total_amount_portfolio)
+        # Полная стоимость портфеля = активы + свободные деньги
+        total_with_cash = total_value + free_cash_rub
 
         categories = {"Акции": 0.0, "Облигации": 0.0, "Золото": 0.0, "Валюта": 0.0}
         for p in positions:
@@ -169,8 +186,9 @@ def get_portfolio_snapshot():
             elif p["type"] == "etf" and p["ticker"] == "AKGD":
                 categories["Золото"] += p["value"]
 
+        # Проценты считаем от ПОЛНОГО портфеля (активы + свободные деньги)
         categories_pct = {
-            k: round(v / total_value * 100, 2) if total_value else 0
+            k: round(v / total_with_cash * 100, 2) if total_with_cash else 0
             for k, v in categories.items()
         }
 
@@ -190,6 +208,7 @@ def get_portfolio_snapshot():
         return {
             "total_value": round(total_value, 2),
             "free_cash_rub": round(free_cash_rub, 2),
+            "total_with_cash": round(total_with_cash, 2),
             "categories": {
                 k: {"value": round(v, 2), "percent": categories_pct[k]}
                 for k, v in categories.items()
