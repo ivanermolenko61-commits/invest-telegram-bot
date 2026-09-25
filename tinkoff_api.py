@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from t_tech.invest import Client
@@ -122,6 +122,9 @@ def get_share_info(tickers):
 
 _OFZ_CACHE_FILE = "ofz_cache.json"
 _OFZ_CACHE_TTL = 1800
+# Версия формата/расчёта кэша. Меняется, когда меняется логика подбора —
+# тогда старый кэш с диска игнорируется и пересчитывается.
+_OFZ_CACHE_VERSION = 2
 _OFZ_CACHE = {"data": None, "ts": 0}
 
 
@@ -131,6 +134,8 @@ def _load_ofz_cache_from_disk():
     try:
         with open(_OFZ_CACHE_FILE, "r", encoding="utf-8") as f:
             cached = json.load(f)
+        if cached.get("version") != _OFZ_CACHE_VERSION:
+            return None
         if time.time() - cached.get("ts", 0) < _OFZ_CACHE_TTL:
             return cached.get("data")
     except Exception:
@@ -141,39 +146,68 @@ def _load_ofz_cache_from_disk():
 def _save_ofz_cache_to_disk(data):
     try:
         with open(_OFZ_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"ts": time.time(), "data": data}, f, ensure_ascii=False)
+            json.dump({"version": _OFZ_CACHE_VERSION, "ts": time.time(), "data": data},
+                      f, ensure_ascii=False)
     except Exception:
         pass
 
 
+def _ytm_from_flows(dirty_price, flows, now):
+    """Доходность к погашению (YTM), % годовых — точный расчёт.
+
+    Ищем ставку y, при которой сумма всех будущих выплат (купоны + номинал),
+    приведённых к сегодняшнему дню, равна цене покупки с НКД:
+        dirty_price = Σ выплата / (1 + y) ^ (дней_до_выплаты / 365)
+    Подбираем y делением отрезка пополам (бисекция): если приведённая
+    стоимость выше цены — ставка слишком мала, сдвигаем нижнюю границу.
+
+    Раньше считалось упрощённо: (купон + (номинал − цена) / лет) / цена.
+    Для ОФЗ сильно ниже номинала это завышало доходность на ~4 п.п.
+    и выводило в «лучшие» на самом деле худшие бумаги.
+    """
+    def present_value(y):
+        return sum(amount / (1 + y) ** ((d - now).days / 365) for d, amount in flows)
+
+    low, high = -0.5, 2.0
+    if not (present_value(high) < dirty_price < present_value(low)):
+        return None
+    for _ in range(100):
+        mid = (low + high) / 2
+        if present_value(mid) > dirty_price:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2 * 100
+
+
 def _calc_ofz_ytm(client, bond, price_rub):
     try:
-        coupons = client.instruments.get_bond_coupons(
-            figi=bond.figi,
-            from_=datetime.now(),
-            to=bond.maturity_date.replace(tzinfo=None),
-        ).events
-
-        if not coupons or bond.coupon_quantity_per_year == 0:
-            return None
-
-        coupon_payment = money_to_float(coupons[0].pay_one_bond)
-        if coupon_payment <= 0:
-            return None
-
-        annual_coupon = coupon_payment * bond.coupon_quantity_per_year
-        nominal = money_to_float(bond.nominal)
-
-        now_naive = datetime.now()
-        maturity_naive = bond.maturity_date.replace(tzinfo=None)
-        days = (maturity_naive - now_naive).days
-        years = days / 365.25
+        now = datetime.now(timezone.utc)
+        maturity = bond.maturity_date
+        years = (maturity - now).days / 365.25
         if years < 1.0:
             return None
 
-        ytm = (annual_coupon + (nominal - price_rub) / years) / price_rub * 100
+        coupons = client.instruments.get_bond_coupons(
+            figi=bond.figi, from_=now, to=maturity,
+        ).events
+        if not coupons or bond.coupon_quantity_per_year == 0:
+            return None
 
-        if not (5.0 <= ytm <= 40.0):
+        # Все будущие купоны должны быть известны. У ОФЗ с плавающим
+        # купоном (29xxx) и у линкеров размер будущих выплат неизвестен —
+        # сумма 0; честно посчитать доходность нельзя, такие пропускаем.
+        payments = [money_to_float(c.pay_one_bond) for c in coupons]
+        if any(p <= 0 for p in payments):
+            return None
+
+        nominal = money_to_float(bond.nominal)
+        aci = money_to_float(bond.aci_value) if bond.aci_value else 0.0
+
+        flows = [(c.coupon_date, p) for c, p in zip(coupons, payments)]
+        flows.append((maturity, nominal))
+        ytm = _ytm_from_flows(price_rub + aci, flows, now)
+        if ytm is None or not (5.0 <= ytm <= 40.0):
             return None
 
         return {
@@ -182,13 +216,13 @@ def _calc_ofz_ytm(client, bond, price_rub):
             "name": bond.name,
             "price": round(price_rub, 2),
             "nominal": nominal,
-            "annual_coupon": round(annual_coupon, 2),
+            "annual_coupon": round(payments[0] * bond.coupon_quantity_per_year, 2),
             "years": round(years, 2),
-            "maturity": bond.maturity_date.strftime("%Y-%m-%d"),
+            "maturity": maturity.strftime("%Y-%m-%d"),
             "lot": bond.lot,
             "ytm": round(ytm, 2),
             # НКД на одну облигацию: при покупке платишь цену + НКД
-            "aci": round(money_to_float(bond.aci_value), 2) if bond.aci_value else 0.0,
+            "aci": round(aci, 2),
         }
     except Exception:
         return None
@@ -209,7 +243,15 @@ def get_top_ofz(limit=5, use_cache=True, debug=False):
 
     with Client(TOKEN) as client:
         all_bonds = client.instruments.bonds().instruments
-        ofz = [b for b in all_bonds if b.ticker.startswith("SU")]
+        # Только ОФЗ с постоянным купоном и без амортизации: у плавающих (29xxx)
+        # будущие купоны неизвестны, у амортизируемых (46xxx) номинал гасится
+        # частями — простая схема «купоны + номинал в конце» к ним не подходит.
+        ofz = [
+            b for b in all_bonds
+            if b.ticker.startswith("SU")
+            and not b.floating_coupon_flag
+            and not b.amortization_flag
+        ]
 
         figi_list = [b.figi for b in ofz]
         prices_resp = client.market_data.get_last_prices(figi=figi_list).last_prices
@@ -222,7 +264,8 @@ def get_top_ofz(limit=5, use_cache=True, debug=False):
                 continue
 
             nominal = money_to_float(b.nominal)
-            price_rub = raw / 100 * nominal if (nominal > 500 and raw < 200) else raw
+            # Цена облигации в API всегда в % от номинала
+            price_rub = raw / 100 * nominal
 
             info = _calc_ofz_ytm(client, b, price_rub)
             if info:
