@@ -219,7 +219,11 @@ def recommend_bonds(snapshot, budget):
             return None, budget
         best = min(bonds, key=lambda b: b["price"] * b["lot"])
 
-    price = best["price"]
+    # При покупке облигации платишь цену + НКД (накопленный купонный доход),
+    # поэтому считаем план по полной цене — иначе он не влезает в бюджет.
+    # .get(..., 0) — в старом дисковом кэше ОФЗ поля "aci" ещё нет.
+    aci = best.get("aci", best.get("nkd", 0.0)) or 0.0
+    price = best["price"] + aci
     lot = best["lot"]
     lot_price = price * lot
 
@@ -235,6 +239,8 @@ def recommend_bonds(snapshot, budget):
         comment += f" · YTM {best_ytm:.2f}%"
     if best.get("maturity"):
         comment += f" · до {best['maturity']}"
+    if aci:
+        comment += f" · цена с НКД {aci:.2f} ₽"
 
     return {
         "category": "Облигации", "sector": None,

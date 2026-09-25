@@ -187,6 +187,8 @@ def _calc_ofz_ytm(client, bond, price_rub):
             "maturity": bond.maturity_date.strftime("%Y-%m-%d"),
             "lot": bond.lot,
             "ytm": round(ytm, 2),
+            # НКД на одну облигацию: при покупке платишь цену + НКД
+            "aci": round(money_to_float(bond.aci_value), 2) if bond.aci_value else 0.0,
         }
     except Exception:
         return None
@@ -258,14 +260,24 @@ def get_portfolio_snapshot():
         by_figi, _ = _build_shares_index(client)
 
         positions = []
+        # Рубли на счёте приходят в портфеле отдельной позицией RUB000UTSTOM
+        # и уже входят в total_amount_portfolio. Запоминаем их, чтобы не
+        # прибавить свободные деньги к итогу второй раз.
+        rub_in_portfolio = 0.0
         for pos in portfolio.positions:
             ticker = pos.ticker
+            if ticker == "RUB000UTSTOM":
+                rub_in_portfolio += money_to_float(pos.quantity) * money_to_float(pos.current_price)
             if ticker in IGNORED_TICKERS:
                 continue
 
-            qty = float(pos.quantity.units)
+            # quantity — Quotation (units + nano): nano нужен для дробных
+            # количеств, например валюты (150.75 USD), иначе дробь терялась
+            qty = money_to_float(pos.quantity)
             price = money_to_float(pos.current_price)
-            value = qty * price
+            # НКД (накопленный купонный доход) — часть стоимости облигации
+            nkd = money_to_float(pos.current_nkd) if pos.current_nkd else 0.0
+            value = qty * (price + nkd)
 
             inst_type = pos.instrument_type
             sector = None
@@ -292,9 +304,11 @@ def get_portfolio_snapshot():
                 "value": value,
                 "lot": lot,
                 "figi": pos.figi,
+                "nkd": nkd,
             })
 
-        total_value = money_to_float(portfolio.total_amount_portfolio)
+        # total_value — портфель БЕЗ свободных рублей, total_with_cash — с ними
+        total_value = money_to_float(portfolio.total_amount_portfolio) - rub_in_portfolio
         total_with_cash = total_value + free_cash_rub
 
         categories = {"Акции": 0.0, "Облигации": 0.0, "Золото": 0.0, "Валюта": 0.0}

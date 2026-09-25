@@ -1,10 +1,12 @@
 """Точка входа Telegram-бота «Инвестиционный помощник»."""
 import asyncio
+import html
 import logging
 import os
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -34,7 +36,9 @@ dp = Dispatcher()
 
 MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
 
-scheduler = AsyncIOScheduler()
+# Явный часовой пояс: в Docker системное время — UTC, и без этого
+# «отчёт в 19:00» приходил бы в 22:00 по Москве
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 
 SECTOR_EMOJI = {
@@ -134,6 +138,21 @@ def main_inline_kb():
     ])
 
 
+# ---------- Редактирование сообщений ----------
+
+async def _safe_edit(message, text, **kwargs):
+    """edit_text, который не падает при повторном нажатии той же кнопки.
+
+    Telegram отвечает ошибкой «message is not modified», если новый текст
+    совпадает со старым. Это не ошибка для пользователя — просто игнорируем.
+    """
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
 # ---------- Форматирование ----------
 
 def format_portfolio(snapshot):
@@ -144,7 +163,7 @@ def format_portfolio(snapshot):
 
     for p in positions[:10]:
         lines.append(
-            f"• <b>{p['name']}</b> — {p['ticker']}\n"
+            f"• <b>{html.escape(p['name'])}</b> — {html.escape(p['ticker'])}\n"
             f"  {p['quantity']:.0f} шт. × {p['price']:.2f} ₽ = "
             f"<b>{p['value']:,.2f} ₽</b>"
         )
@@ -260,7 +279,7 @@ def format_plan(recs, budget, snapshot=None):
                     name_part = name_part.replace(" (добор)", "")
 
                     lines.append(
-                        f"      • <b>{r['ticker']}</b> — {name_part}\n"
+                        f"      • <b>{html.escape(r['ticker'])}</b> — {html.escape(name_part)}\n"
                         f"        {r['quantity']:.0f} шт × {r['price']:.2f} ₽ "
                         f"= <b>{r['amount']:,.0f} ₽</b>"
                     )
@@ -268,12 +287,12 @@ def format_plan(recs, budget, snapshot=None):
         else:
             for r in items:
                 lines.append(
-                    f"   • <b>{r['name']}</b> ({r['ticker']})\n"
+                    f"   • <b>{html.escape(r['name'])}</b> ({html.escape(r['ticker'])})\n"
                     f"     {r['quantity']:.0f} шт × {r['price']:.2f} ₽ "
                     f"= <b>{r['amount']:,.0f} ₽</b>"
                 )
                 if r.get("comment"):
-                    lines.append(f"     <i>{r['comment']}</i>")
+                    lines.append(f"     <i>{html.escape(r['comment'])}</i>")
                 total_plan += r["amount"]
 
     lines.append(f"\n💰 <b>Итого:</b> {total_plan:,.2f} ₽ из {budget:,.2f} ₽")
@@ -328,11 +347,11 @@ async def cmd_help(message: Message):
 async def cmd_portfolio(message: Message):
     await message.answer("⏳ Запрашиваю портфель…")
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
-            f"⚠️ Не удалось получить портфель.\n\n<code>{e}</code>",
+            f"⚠️ Не удалось получить портфель.\n\n<code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -348,11 +367,11 @@ async def cmd_portfolio(message: Message):
 async def cmd_structure(message: Message):
     await message.answer("⏳ Считаю структуру…")
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
-            f"⚠️ Ошибка: <code>{e}</code>",
+            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -400,8 +419,8 @@ async def cmd_analyze(message: Message):
     await message.answer("🤔 Анализирую портфель… Это может занять несколько секунд.")
 
     try:
-        snapshot = get_portfolio_snapshot()
-        analysis = analyze_portfolio(snapshot)
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        analysis = await asyncio.to_thread(analyze_portfolio, snapshot)
         await message.answer(analysis)
     except Exception as e:
         logging.exception("Ошибка AI-анализа")
@@ -410,7 +429,7 @@ async def cmd_analyze(message: Message):
 
 async def _send_plan(message: Message, override):
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
         budget = override if override is not None else snapshot["free_cash_rub"]
 
         if budget <= 0:
@@ -422,11 +441,13 @@ async def _send_plan(message: Message, override):
             )
             return
 
-        recs = recommend(snapshot, override_budget=budget)
+        # Расчёт плана ходит в API (ОФЗ, wishlist) — выносим в поток,
+        # чтобы бот не «замирал» для остальных сообщений
+        recs = await asyncio.to_thread(recommend, snapshot, override_budget=budget)
     except Exception as e:
         logging.exception("Ошибка при расчёте плана")
         await message.answer(
-            f"⚠️ Не удалось рассчитать план.\n\n<code>{e}</code>",
+            f"⚠️ Не удалось рассчитать план.\n\n<code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -475,7 +496,7 @@ async def msg_help(message: Message):
 
 @dp.callback_query(F.data == "back")
 async def cb_back(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         "🎛 <b>Главное меню</b>",
         parse_mode="HTML",
         reply_markup=main_inline_kb(),
@@ -485,7 +506,7 @@ async def cb_back(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "help")
 async def cb_help(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         help_text(),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -497,16 +518,16 @@ async def cb_help(callback: CallbackQuery):
 async def cb_portfolio(callback: CallbackQuery):
     await callback.answer("⏳ Загружаю…")
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
     except Exception as e:
-        await callback.message.edit_text(
-            f"⚠️ Ошибка: <code>{e}</code>",
+        await _safe_edit(callback.message,
+            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
         return
 
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         format_portfolio(snapshot),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -517,16 +538,16 @@ async def cb_portfolio(callback: CallbackQuery):
 async def cb_structure(callback: CallbackQuery):
     await callback.answer("⏳ Считаю…")
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
     except Exception as e:
-        await callback.message.edit_text(
-            f"⚠️ Ошибка: <code>{e}</code>",
+        await _safe_edit(callback.message,
+            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
         return
 
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         format_structure(snapshot),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -541,18 +562,18 @@ async def cb_analyze(callback: CallbackQuery):
 
     await callback.answer("🤔 Анализирую…")
     try:
-        snapshot = get_portfolio_snapshot()
-        analysis = analyze_portfolio(snapshot)
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        analysis = await asyncio.to_thread(analyze_portfolio, snapshot)
     except Exception as e:
         logging.exception("Ошибка AI-анализа")
-        await callback.message.edit_text(
-            f"⚠️ Ошибка AI-анализа: <code>{e}</code>",
+        await _safe_edit(callback.message,
+            f"⚠️ Ошибка AI-анализа: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
         return
 
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         analysis,
         reply_markup=back_kb(),
     )
@@ -560,7 +581,7 @@ async def cb_analyze(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "buy_menu")
 async def cb_buy_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await _safe_edit(callback.message,
         "💰 <b>На какую сумму считать план?</b>\n\n"
         "Выбери быструю сумму или отправь вручную:\n"
         "<code>/what_to_buy 50000</code>",
@@ -593,7 +614,7 @@ async def cb_buy_amount(callback: CallbackQuery):
 async def send_daily_report():
     logging.info("Отправка ежедневного отчёта")
     try:
-        snapshot = get_portfolio_snapshot()
+        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
         text = (
             "🌙 <b>Вечерний отчёт</b>\n\n"
             + format_portfolio(snapshot)
