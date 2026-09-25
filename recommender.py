@@ -154,7 +154,7 @@ def recommend_currency(snapshot, budget):
             "name": "Китайский юань", "ticker": "CNYRUB_TOM_CETS",
             "quantity": bought_cny, "price": cny_price,
             "amount": round(bought_cny * cny_price, 2),
-            "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
+            "comment": "",
         })
     if bought_usd > 0:
         result.append({
@@ -162,7 +162,7 @@ def recommend_currency(snapshot, budget):
             "name": "Доллар США", "ticker": "USD000UTSTOM",
             "quantity": bought_usd, "price": usd_price,
             "amount": round(bought_usd * usd_price, 2),
-            "comment": f"Валюта {cats['Валюта']['percent']:.2f}% → цель {TARGETS['Валюта']}%",
+            "comment": "",
         })
 
     spent = sum(r["amount"] for r in result)
@@ -192,7 +192,7 @@ def recommend_gold(snapshot, budget):
     return {
         "category": "Золото", "sector": None, "name": "Альфа-Капитал Золото", "ticker": "AKGD",
         "quantity": qty, "price": price, "amount": amount,
-        "comment": f"Золото {cats['Золото']['percent']:.2f}% → цель {TARGETS['Золото']}%",
+        "comment": "",
     }, budget - amount
 
 
@@ -234,20 +234,26 @@ def recommend_bonds(snapshot, budget):
     qty = n * lot
     amount = qty * price
 
-    comment = f"Облигации {cats['Облигации']['percent']:.2f}% → цель {TARGETS['Облигации']}%"
+    # Доли категорий в текст рекомендации больше не пишем: здесь snapshot
+    # «разбавлен» бюджетом (деньги учтены до покупки), и цифра выглядела как
+    # текущая доля, хотя ею не была. Доли «сейчас → после покупки» считает bot.py.
+    comment = []
     if best_ytm:
-        comment += f" · YTM {best_ytm:.2f}%"
+        comment.append(f"YTM {best_ytm:.2f}%")
     if best.get("maturity"):
-        comment += f" · до {best['maturity']}"
-    if aci:
-        comment += f" · цена с НКД {aci:.2f} ₽"
+        comment.append(f"до {best['maturity']}")
 
     return {
         "category": "Облигации", "sector": None,
         "name": best["name"],
         "ticker": best["ticker"],
         "quantity": qty, "price": price, "amount": amount,
-        "comment": comment,
+        "comment": " · ".join(comment),
+        # Для красивого вывода в боте
+        "ytm": best_ytm,
+        "maturity": best.get("maturity"),
+        "clean_price": best["price"],
+        "aci": aci,
     }, budget - amount
 
 

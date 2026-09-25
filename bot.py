@@ -21,7 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 from tinkoff_api import get_portfolio_snapshot
-from recommender import recommend
+from recommender import TARGETS, recommend
 from ai_advisor import analyze_portfolio, is_enabled
 
 load_dotenv()
@@ -155,6 +155,26 @@ async def _safe_edit(message, text, **kwargs):
 
 # ---------- Форматирование ----------
 
+NBSP = " "  # неразрывный пробел: «4 489 ₽» не разорвётся на две строки
+
+CATEGORY_EMOJI = {"Валюта": "💵", "Золото": "🥇", "Облигации": "📜", "Акции": "📈"}
+
+
+def _rub(x, decimals=0):
+    """Сумма по-русски: 4489.5 → «4 490 ₽», с decimals=2 → «4 489,50 ₽»."""
+    s = f"{x:,.{decimals}f}".replace(",", NBSP).replace(".", ",")
+    return f"{s}{NBSP}₽"
+
+
+def _pct(x, decimals=1):
+    """Процент по-русски: 10.26 → «10,3%»."""
+    return f"{x:.{decimals}f}".replace(".", ",") + "%"
+
+
+def _num(x, decimals=2):
+    return f"{x:,.{decimals}f}".replace(",", NBSP).replace(".", ",")
+
+
 def format_portfolio(snapshot):
     positions = [p for p in snapshot["positions"] if p["type"] == "share"]
     positions.sort(key=lambda p: p["value"], reverse=True)
@@ -164,23 +184,23 @@ def format_portfolio(snapshot):
     for p in positions[:10]:
         lines.append(
             f"• <b>{html.escape(p['name'])}</b> — {html.escape(p['ticker'])}\n"
-            f"  {p['quantity']:.0f} шт. × {p['price']:.2f} ₽ = "
-            f"<b>{p['value']:,.2f} ₽</b>"
+            f"  {p['quantity']:.0f} шт × {_num(p['price'])} ₽ = "
+            f"<b>{_rub(p['value'], 2)}</b>"
         )
 
     if len(positions) > 10:
         lines.append(f"\n<i>… и ещё {len(positions) - 10} акций</i>")
 
     cats = snapshot["categories"]
-    lines.append(f"\n💰 <b>Всего:</b> {snapshot['total_value']:,.2f} ₽")
+    lines.append(f"\n💰 <b>Всего:</b> {_rub(snapshot['total_value'], 2)}")
     lines.append(
-        f"   Акции: {cats['Акции']['percent']:.1f}% · "
-        f"Облигации: {cats['Облигации']['percent']:.1f}% · "
-        f"Золото: {cats['Золото']['percent']:.1f}% · "
-        f"Валюта: {cats['Валюта']['percent']:.1f}%"
+        f"   Акции {_pct(cats['Акции']['percent'])} · "
+        f"Облигации {_pct(cats['Облигации']['percent'])} · "
+        f"Золото {_pct(cats['Золото']['percent'])} · "
+        f"Валюта {_pct(cats['Валюта']['percent'])}"
     )
     if snapshot["free_cash_rub"] > 0:
-        lines.append(f"💵 <b>Свободно:</b> {snapshot['free_cash_rub']:,.2f} ₽")
+        lines.append(f"💵 <b>Свободно:</b> {_rub(snapshot['free_cash_rub'], 2)}")
 
     return "\n".join(lines)
 
@@ -189,29 +209,42 @@ def format_structure(snapshot):
     lines = ["⚖️ <b>Структура портфеля</b>\n"]
 
     cats = snapshot["categories"]
-    targets = {"Акции": 70, "Облигации": 15, "Золото": 10, "Валюта": 5}
 
     lines.append("<b>Категории:</b>")
     for name, data in cats.items():
-        target = targets[name]
+        target = TARGETS[name]
         diff = data["percent"] - target
         arrow = "🟢" if abs(diff) < 0.5 else ("🔴" if diff < 0 else "🟡")
-        sign = "+" if diff >= 0 else ""
+        sign = "+" if diff >= 0 else "−"
         lines.append(
-            f"{arrow} {name}: {data['percent']:.2f}% "
-            f"(цель {target}%, {sign}{diff:.2f} п.п.)"
+            f"{arrow} {name}: {_pct(data['percent'], 2)} "
+            f"(цель {_pct(target, 0)}, {sign}{_num(abs(diff))} п.п.)"
         )
 
     lines.append("\n<b>Отрасли (акции):</b>")
     sectors = sorted(snapshot["by_sector"].items(), key=lambda x: x[1]["value"])
     for sector, data in sectors:
         icon = SECTOR_EMOJI.get(sector, "🔸")
-        lines.append(f"{icon} {sector}: {data['percent']:.2f}%")
+        lines.append(f"{icon} {sector}: {_pct(data['percent'], 2)}")
 
     return "\n".join(lines)
 
 
+def _item_line(title, r):
+    """Строка позиции плана: «• Название — 5 шт × 897,82 ₽ = 4 489 ₽»."""
+    return (
+        f"   • <b>{html.escape(title)}</b>\n"
+        f"      {r['quantity']:.0f} шт × {_num(r['price'])} ₽ = <b>{_rub(r['amount'])}</b>"
+    )
+
+
 def format_plan(recs, budget, snapshot=None):
+    """План покупок.
+
+    Доли категорий: «сейчас → после покупки». Сейчас — от реального портфеля
+    (как в «Структуре»). После — портфель + весь бюджет: в обоих режимах
+    (свободные деньги или сумма вручную) итог после покупки = бумаги + бюджет.
+    """
     if not recs:
         return (
             "✅ <b>Рекомендаций нет.</b>\n\n"
@@ -222,54 +255,49 @@ def format_plan(recs, budget, snapshot=None):
     for r in recs:
         by_cat.setdefault(r["category"], []).append(r)
 
-    stocks_now = 0.0
-    stocks_add = 0.0
-    if snapshot:
-        stocks_now = snapshot["categories"]["Акции"]["value"]
-    for r in by_cat.get("Акции", []):
-        stocks_add += r["amount"]
-    stocks_after = stocks_now + stocks_add
+    total_now = snapshot["total_with_cash"] if snapshot else 0.0
+    total_after = (snapshot["total_value"] + budget) if snapshot else 0.0
 
-    lines = [f"📋 <b>План покупок на {budget:,.0f} ₽</b>"]
+    stocks_now = snapshot["categories"]["Акции"]["value"] if snapshot else 0.0
+    stocks_after = stocks_now + sum(r["amount"] for r in by_cat.get("Акции", []))
 
-    order = ["Валюта", "Золото", "Облигации", "Акции"]
-    emoji = {"Валюта": "💵", "Золото": "🥇", "Облигации": "📜", "Акции": "📈"}
+    lines = [f"📋 <b>План покупок на {_rub(budget)}</b>"]
 
     total_plan = 0
-    for cat in order:
+    for cat in ["Валюта", "Золото", "Облигации", "Акции"]:
         items = by_cat.get(cat)
         if not items:
             continue
 
         cat_sum = sum(r["amount"] for r in items)
-        lines.append(f"\n{emoji[cat]} <b>{cat}</b> ({cat_sum:,.0f} ₽)")
+        total_plan += cat_sum
+        lines.append(f"\n{CATEGORY_EMOJI[cat]} <b>{cat} — {_rub(cat_sum)}</b>")
+
+        if snapshot and total_now > 0 and total_after > 0:
+            value_now = snapshot["categories"][cat]["value"]
+            pct_now = value_now / total_now * 100
+            pct_after = (value_now + cat_sum) / total_after * 100
+            lines.append(
+                f"   доля {_pct(pct_now)} → {_pct(pct_after)} · цель {_pct(TARGETS[cat], 0)}"
+            )
 
         if cat == "Акции":
             by_sector = {}
             for r in items:
                 by_sector.setdefault(r["sector"], []).append(r)
 
-            sectors_sorted = sorted(
-                by_sector.items(),
-                key=lambda x: sum(r["amount"] for r in x[1]),
-            )
-
-            for sector, sector_items in sectors_sorted:
+            for sector, sector_items in sorted(
+                by_sector.items(), key=lambda x: sum(r["amount"] for r in x[1]),
+            ):
                 sector_sum = sum(r["amount"] for r in sector_items)
                 icon = SECTOR_EMOJI.get(sector, "🔸")
-
-                pct_now = None
-                pct_after = None
-                if snapshot and sector in snapshot.get("by_sector", {}):
-                    if stocks_now > 0 and stocks_after > 0:
-                        sector_now = snapshot["by_sector"][sector]["value"]
-                        sector_after = sector_now + sector_sum
-                        pct_now = sector_now / stocks_now * 100
-                        pct_after = sector_after / stocks_after * 100
-
-                header = f"\n   {icon} <b>{sector}</b> ({sector_sum:,.0f} ₽)"
-                if pct_now is not None and pct_after is not None:
-                    header += f" · {pct_now:.1f}% → {pct_after:.1f}%"
+                header = f"\n   {icon} <b>{sector}</b> — {_rub(sector_sum)}"
+                if snapshot and sector in snapshot.get("by_sector", {}) and stocks_now > 0:
+                    sector_now = snapshot["by_sector"][sector]["value"]
+                    header += (
+                        f"\n      в акциях {_pct(sector_now / stocks_now * 100)}"
+                        f" → {_pct((sector_now + sector_sum) / stocks_after * 100)}"
+                    )
                 lines.append(header)
 
                 for r in sector_items:
@@ -277,26 +305,31 @@ def format_plan(recs, budget, snapshot=None):
                     if ": " in name_part:
                         name_part = name_part.split(": ", 1)[1]
                     name_part = name_part.replace(" (добор)", "")
-
                     lines.append(
                         f"      • <b>{html.escape(r['ticker'])}</b> — {html.escape(name_part)}\n"
-                        f"        {r['quantity']:.0f} шт × {r['price']:.2f} ₽ "
-                        f"= <b>{r['amount']:,.0f} ₽</b>"
+                        f"         {r['quantity']:.0f} шт × {_num(r['price'])} ₽ = <b>{_rub(r['amount'])}</b>"
                     )
-                    total_plan += r["amount"]
         else:
             for r in items:
-                lines.append(
-                    f"   • <b>{html.escape(r['name'])}</b> ({html.escape(r['ticker'])})\n"
-                    f"     {r['quantity']:.0f} шт × {r['price']:.2f} ₽ "
-                    f"= <b>{r['amount']:,.0f} ₽</b>"
-                )
-                if r.get("comment"):
-                    lines.append(f"     <i>{html.escape(r['comment'])}</i>")
-                total_plan += r["amount"]
+                if cat == "Облигации":
+                    lines.append(_item_line(f"{r['name']} ({r['ticker']})", r))
+                    details = []
+                    if r.get("ytm"):
+                        details.append(f"доходность {_pct(r['ytm'], 2)}")
+                    if r.get("maturity"):
+                        y, m, d = r["maturity"].split("-")
+                        details.append(f"погашение {d}.{m}.{y}")
+                    if details:
+                        lines.append(f"      {' · '.join(details)}")
+                    if r.get("aci"):
+                        lines.append(
+                            f"      цена {_num(r['clean_price'])} ₽ + НКД {_num(r['aci'])} ₽"
+                        )
+                else:
+                    lines.append(_item_line(r["name"], r))
 
-    lines.append(f"\n💰 <b>Итого:</b> {total_plan:,.2f} ₽ из {budget:,.2f} ₽")
-    lines.append(f"💵 <b>Остаток:</b> {budget - total_plan:,.2f} ₽")
+    lines.append(f"\n💰 <b>Итого:</b> {_rub(total_plan, 2)} из {_rub(budget, 2)}")
+    lines.append(f"💵 <b>Остаток:</b> {_rub(budget - total_plan, 2)}")
 
     return "\n".join(lines)
 
