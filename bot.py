@@ -47,7 +47,7 @@ dp = Dispatcher()
 
 # Таймауты внешних вызовов (сек): потоки с API не должны вешать обработчик навсегда
 SNAPSHOT_TIMEOUT = 120
-PLAN_TIMEOUT = 300
+PLAN_TIMEOUT = 330
 AI_TIMEOUT = 90
 TG_MESSAGE_LIMIT = 4096
 

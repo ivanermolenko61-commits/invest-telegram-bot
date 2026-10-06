@@ -147,8 +147,10 @@ _OFZ_CACHE = {"data": None, "ts": 0, "partial": False}
 _OFZ_LOCK = threading.Lock()
 # Сколько ждать лок, пока другой поток считает топ (сек)
 _OFZ_LOCK_TIMEOUT = 60
-# Общий дедлайн на обход облигаций в _compute_top_ofz (сек)
-_OFZ_COMPUTE_DEADLINE = 240
+# Общий дедлайн на обход облигаций в _compute_top_ofz (сек).
+# Ожидание лока (60) + дедлайн (180) оставляют запас до PLAN_TIMEOUT (bot.py); это не жёсткая
+# гарантия: у gRPC-вызовов нет своего таймаута, а после ОФЗ план ещё считает акции
+_OFZ_COMPUTE_DEADLINE = 180
 
 
 def _load_ofz_cache_from_disk(max_age=_OFZ_CACHE_TTL):
@@ -226,13 +228,14 @@ def _retry_delay(e, attempt, base_delay):
     return base_delay * 2 ** attempt
 
 
-def _call_with_retry(func, attempts=4, base_delay=1.0, **kwargs):
+def _call_with_retry(func, attempts=4, base_delay=1.0, deadline=None, **kwargs):
     """Вызов API с ретраями только при временных ошибках.
 
     Повторяем RESOURCE_EXHAUSTED / UNAVAILABLE / DEADLINE_EXCEEDED
     (пауза — ratelimit_reset или 1, 2, 4 с). Остальные ошибки
     (NOT_FOUND, INVALID_ARGUMENT, UNAUTHENTICATED…) и последняя
     неудачная попытка пробрасываются сразу, без пауз.
+    deadline (time.monotonic) — если пауза выводит за него, не спим, а пробрасываем ошибку.
     """
     for attempt in range(attempts):
         try:
@@ -241,11 +244,13 @@ def _call_with_retry(func, attempts=4, base_delay=1.0, **kwargs):
             if not _is_retryable(e) or attempt == attempts - 1:
                 raise
             delay = _retry_delay(e, attempt, base_delay)
+            if deadline is not None and time.monotonic() + delay > deadline:
+                raise
             logging.warning("Ошибка API (%s), повтор через %.0f с", e.code, delay)
             time.sleep(delay)
 
 
-def _calc_ofz_ytm(client, bond, price_rub):
+def _calc_ofz_ytm(client, bond, price_rub, deadline=None):
     now = datetime.now(timezone.utc)
     maturity = bond.maturity_date
     years = (maturity - now).days / 365.25
@@ -255,7 +260,7 @@ def _calc_ofz_ytm(client, bond, price_rub):
     # Ошибки API не глушим: вызывающий должен знать, что результат неполный
     coupons = _call_with_retry(
         client.instruments.get_bond_coupons,
-        figi=bond.figi, from_=now, to=maturity,
+        figi=bond.figi, from_=now, to=maturity, deadline=deadline,
     ).events
 
     try:
@@ -334,7 +339,20 @@ def get_top_ofz(limit=5, use_cache=True):
             cached = _get_ofz_cached(limit)
             if cached is not None:
                 return cached
-        return _compute_top_ofz(limit)
+        try:
+            result = _compute_top_ofz(limit)
+        except Exception:
+            stale = _get_ofz_stale(limit)
+            if not stale:
+                raise
+            logging.exception("Пересчёт топа ОФЗ не удался, возвращаю устаревший кэш")
+            return stale
+        if not result:
+            stale = _get_ofz_stale(limit)
+            if stale:
+                logging.warning("Пересчёт топа ОФЗ дал пустой результат, возвращаю устаревший кэш")
+                return stale
+        return result
     finally:
         _OFZ_LOCK.release()
 
@@ -382,10 +400,14 @@ def _compute_top_ofz(limit):
             price_rub = raw / 100 * nominal
 
             try:
-                info = _calc_ofz_ytm(client, b, price_rub)
-            except RequestError:
+                info = _calc_ofz_ytm(client, b, price_rub, deadline)
+            except RequestError as e:
                 failed += 1
                 logging.exception("Не удалось получить купоны %s", b.ticker)
+                if _is_retryable(e):
+                    # API перегружен/недоступен даже после ретраев — не долбим остальные бумаги
+                    logging.warning("ОФЗ: временная ошибка API, обход прерван")
+                    break
                 continue
             if info:
                 results.append(info)
@@ -397,6 +419,16 @@ def _compute_top_ofz(limit):
         # Полностью пустой результат не кэшируем. Неполный (были ошибки API)
         # — только в памяти и с коротким TTL, на диск не пишем
         if results:
+            prev = _OFZ_CACHE["data"]
+            if failed and prev and len(prev) > len(results):
+                # Неполный результат не вытесняет из памяти более полный (даже истёкший) кэш
+                logging.warning(
+                    "ОФЗ: %d бумаг пропущено из-за ошибок API, в кэше больше бумаг (%d > %d) — "
+                    "оставляю его", failed, len(prev), len(results))
+                # Продлеваем старый кэш на короткий TTL, чтобы не пересчитывать при каждом запросе
+                _OFZ_CACHE["ts"] = time.time()
+                _OFZ_CACHE["partial"] = True
+                return prev[:limit]
             _OFZ_CACHE["data"] = results
             _OFZ_CACHE["ts"] = time.time()
             _OFZ_CACHE["partial"] = bool(failed)
