@@ -24,4 +24,8 @@ COPY tinkoff_api.py .
 COPY recommender.py .
 COPY ai_advisor.py .
 
+# Не root: пишем только ofz_cache.json в /app, поэтому отдаём пользователю саму папку
+RUN useradd --create-home --uid 1000 appuser && chown appuser:appuser /app
+USER appuser
+
 CMD ["python", "bot.py"]

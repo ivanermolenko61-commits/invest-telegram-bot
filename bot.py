@@ -2,7 +2,9 @@
 import asyncio
 import html
 import logging
+import math
 import os
+import sys
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -31,10 +33,21 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-bot = Bot(token=os.getenv("BOT_TOKEN"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MY_CHAT_ID = int(os.getenv("MY_CHAT_ID") or "0")
+
+# Без токена и владельца бот либо не стартует, либо молча игнорирует всех
+if not BOT_TOKEN or MY_CHAT_ID == 0:
+    sys.exit("Ошибка: задайте BOT_TOKEN и MY_CHAT_ID в .env (переменные пусты или не заданы)")
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
+# Таймауты внешних вызовов (сек): потоки с API не должны вешать обработчик навсегда
+SNAPSHOT_TIMEOUT = 120
+PLAN_TIMEOUT = 300
+AI_TIMEOUT = 90
+TG_MESSAGE_LIMIT = 4096
 
 # Явный часовой пояс: в Docker системное время — UTC, и без этого
 # «отчёт в 19:00» приходил бы в 22:00 по Москве
@@ -153,6 +166,47 @@ async def _safe_edit(message, text, **kwargs):
             raise
 
 
+async def _with_timeout(func, timeout, *args, **kwargs):
+    """asyncio.to_thread с таймаутом и понятным сообщением об ошибке."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"нет ответа за {timeout} с") from None
+
+
+async def _get_snapshot():
+    return await _with_timeout(get_portfolio_snapshot, SNAPSHOT_TIMEOUT)
+
+
+def _split_message(text, limit=TG_MESSAGE_LIMIT):
+    """Режет текст на части ≤ limit символов по переводам строки."""
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # одна очень длинная строка — режем жёстко
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + 1 + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _answer_long(message, text, reply_markup=None, **kwargs):
+    """message.answer для длинных текстов: клавиатура — только на последней части."""
+    chunks = _split_message(text)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await message.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
+
+
 # ---------- Форматирование ----------
 
 NBSP = " "  # неразрывный пробел: «4 489 ₽» не разорвётся на две строки
@@ -192,7 +246,7 @@ def format_portfolio(snapshot):
         lines.append(f"\n<i>… и ещё {len(positions) - 10} акций</i>")
 
     cats = snapshot["categories"]
-    lines.append(f"\n💰 <b>Всего:</b> {_rub(snapshot['total_value'], 2)}")
+    lines.append(f"\n💰 <b>Всего в категориях:</b> {_rub(snapshot['total_value'], 2)}")
     lines.append(
         f"   Акции {_pct(cats['Акции']['percent'])} · "
         f"Облигации {_pct(cats['Облигации']['percent'])} · "
@@ -380,7 +434,7 @@ async def cmd_help(message: Message):
 async def cmd_portfolio(message: Message):
     await message.answer("⏳ Запрашиваю портфель…")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
@@ -400,7 +454,7 @@ async def cmd_portfolio(message: Message):
 async def cmd_structure(message: Message):
     await message.answer("⏳ Считаю структуру…")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
@@ -409,7 +463,8 @@ async def cmd_structure(message: Message):
         )
         return
 
-    await message.answer(
+    await _answer_long(
+        message,
         format_structure(snapshot),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -426,9 +481,12 @@ async def cmd_what_to_buy(message: Message):
         raw = parts[1].strip().replace(" ", "").replace(",", ".")
         try:
             override = float(raw)
+            if not (math.isfinite(override) and 0 < override <= 1e8):
+                raise ValueError("сумма вне допустимого диапазона")
         except ValueError:
             await message.answer(
-                f"⚠️ Не понял бюджет: <code>{parts[1]}</code>\n"
+                f"⚠️ Не понял бюджет: <code>{html.escape(parts[1])}</code>\n"
+                f"Нужно положительное число не больше 100 000 000.\n"
                 f"Пример: <code>/what_to_buy 15000</code>",
                 parse_mode="HTML",
             )
@@ -452,9 +510,9 @@ async def cmd_analyze(message: Message):
     await message.answer("🤔 Анализирую портфель… Это может занять несколько секунд.")
 
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
-        analysis = await asyncio.to_thread(analyze_portfolio, snapshot)
-        await message.answer(analysis)
+        snapshot = await _get_snapshot()
+        analysis = await _with_timeout(analyze_portfolio, AI_TIMEOUT, snapshot)
+        await _answer_long(message, analysis)
     except Exception as e:
         logging.exception("Ошибка AI-анализа")
         await message.answer(f"⚠️ Не удалось выполнить анализ: {e}")
@@ -462,7 +520,7 @@ async def cmd_analyze(message: Message):
 
 async def _send_plan(message: Message, override):
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
         budget = override if override is not None else snapshot["free_cash_rub"]
 
         if budget <= 0:
@@ -476,7 +534,7 @@ async def _send_plan(message: Message, override):
 
         # Расчёт плана ходит в API (ОФЗ, wishlist) — выносим в поток,
         # чтобы бот не «замирал» для остальных сообщений
-        recs = await asyncio.to_thread(recommend, snapshot, override_budget=budget)
+        recs = await _with_timeout(recommend, PLAN_TIMEOUT, snapshot, override_budget=budget)
     except Exception as e:
         logging.exception("Ошибка при расчёте плана")
         await message.answer(
@@ -485,7 +543,8 @@ async def _send_plan(message: Message, override):
         )
         return
 
-    await message.answer(
+    await _answer_long(
+        message,
         format_plan(recs, budget, snapshot),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -551,8 +610,9 @@ async def cb_help(callback: CallbackQuery):
 async def cb_portfolio(callback: CallbackQuery):
     await callback.answer("⏳ Загружаю…")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
     except Exception as e:
+        logging.exception("Ошибка Tinkoff API")
         await _safe_edit(callback.message,
             f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
@@ -571,8 +631,9 @@ async def cb_portfolio(callback: CallbackQuery):
 async def cb_structure(callback: CallbackQuery):
     await callback.answer("⏳ Считаю…")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
     except Exception as e:
+        logging.exception("Ошибка Tinkoff API")
         await _safe_edit(callback.message,
             f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
             parse_mode="HTML",
@@ -595,8 +656,8 @@ async def cb_analyze(callback: CallbackQuery):
 
     await callback.answer("🤔 Анализирую…")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
-        analysis = await asyncio.to_thread(analyze_portfolio, snapshot)
+        snapshot = await _get_snapshot()
+        analysis = await _with_timeout(analyze_portfolio, AI_TIMEOUT, snapshot)
     except Exception as e:
         logging.exception("Ошибка AI-анализа")
         await _safe_edit(callback.message,
@@ -606,10 +667,25 @@ async def cb_analyze(callback: CallbackQuery):
         )
         return
 
-    await _safe_edit(callback.message,
-        analysis,
-        reply_markup=back_kb(),
-    )
+    # Ответ может не влезть в одно сообщение: первая часть — правкой, остальные — новыми
+    chunks = _split_message(analysis) or ["(пустой ответ)"]
+    try:
+        await _safe_edit(callback.message,
+            chunks[0],
+            reply_markup=back_kb() if len(chunks) == 1 else None,
+        )
+        for i, chunk in enumerate(chunks[1:], start=1):
+            is_last = i == len(chunks) - 1
+            await callback.message.answer(chunk, reply_markup=back_kb() if is_last else None)
+    except Exception as e:
+        logging.exception("Не удалось отправить результат AI-анализа")
+        try:
+            await callback.message.answer(
+                f"⚠️ Не удалось отправить результат анализа: {e}",
+                reply_markup=back_kb(),
+            )
+        except Exception:
+            logging.exception("Не удалось отправить сообщение об ошибке")
 
 
 @dp.callback_query(F.data == "buy_menu")
@@ -647,19 +723,21 @@ async def cb_buy_amount(callback: CallbackQuery):
 async def send_daily_report():
     logging.info("Отправка ежедневного отчёта")
     try:
-        snapshot = await asyncio.to_thread(get_portfolio_snapshot)
+        snapshot = await _get_snapshot()
         text = (
             "🌙 <b>Вечерний отчёт</b>\n\n"
             + format_portfolio(snapshot)
             + "\n\n"
             + format_structure(snapshot)
         )
-        await bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=main_reply_kb(),
-        )
+        chunks = _split_message(text)
+        for i, chunk in enumerate(chunks):
+            await bot.send_message(
+                chat_id=MY_CHAT_ID,
+                text=chunk,
+                parse_mode="HTML",
+                reply_markup=main_reply_kb() if i == len(chunks) - 1 else None,
+            )
         logging.info("Отчёт отправлен")
     except Exception:
         logging.exception("Ошибка при отправке отчёта")

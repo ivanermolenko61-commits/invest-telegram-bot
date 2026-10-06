@@ -3,6 +3,7 @@
 Изолирован от основной логики: если что-то пойдёт не так, бот продолжит
 работать без этой команды.
 """
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -72,10 +73,7 @@ def _format_portfolio_for_prompt(snapshot) -> str:
 def analyze_portfolio(snapshot) -> str:
     """Отправляет данные портфеля в YandexGPT и возвращает анализ."""
     if not is_enabled():
-        return (
-            "⚠️ AI-анализ не настроен.\n\n"
-            "Добавьте <code>YANDEX_API_KEY</code> и <code>YANDEX_FOLDER_ID</code> в .env"
-        )
+        return "⚠️ AI-анализ не настроен: добавьте YANDEX_API_KEY и YANDEX_FOLDER_ID в .env"
 
     portfolio_text = _format_portfolio_for_prompt(snapshot)
 
@@ -99,11 +97,12 @@ def analyze_portfolio(snapshot) -> str:
         result = model.run([
             {"role": "system", "text": system_prompt},
             {"role": "user", "text": user_prompt},
-        ])
+        ], timeout=60)
 
         for alternative in result:
             return alternative.text
 
         return "Не удалось получить ответ от модели."
     except Exception as e:
+        logging.exception("Ошибка YandexGPT")
         return f"⚠️ Ошибка YandexGPT: {e}"

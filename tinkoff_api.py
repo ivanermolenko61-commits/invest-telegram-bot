@@ -1,11 +1,14 @@
 """Модуль для работы с T-Invest API: портфель, позиции, свободные средства."""
 import json
+import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from t_tech.invest import Client
+from t_tech.invest.exceptions import RequestError
 
 load_dotenv()
 TOKEN = os.getenv("TINKOFF_TOKEN")
@@ -55,13 +58,22 @@ def get_main_account_id(client):
     return main.id
 
 
+# Справочник акций большой и почти не меняется — кэшируем на 24 часа,
+# чтобы не качать его при каждом снимке портфеля и расчёте плана
+_SHARES_CACHE_TTL = 24 * 3600
+_SHARES_CACHE = {"data": None, "ts": 0}
+
+
 def _build_shares_index(client):
-    """Строит два индекса справочника акций:
+    """Строит два индекса справочника акций (с кэшем на 24 часа):
 
     - by_figi: {figi: share} — для точного матчинга портфельных бумаг
     - by_ticker_rub: {ticker: share} — только российские (currency=rub),
       для wishlist-тикеров (без омонимов вроде T → AT&T)
     """
+    if _SHARES_CACHE["data"] is not None and time.time() - _SHARES_CACHE["ts"] < _SHARES_CACHE_TTL:
+        return _SHARES_CACHE["data"]
+
     all_shares = client.instruments.shares().instruments
 
     by_figi = {}
@@ -74,6 +86,8 @@ def _build_shares_index(client):
         if s.currency == "rub" and s.ticker not in by_ticker_rub:
             by_ticker_rub[s.ticker] = s
 
+    _SHARES_CACHE["data"] = (by_figi, by_ticker_rub)
+    _SHARES_CACHE["ts"] = time.time()
     return by_figi, by_ticker_rub
 
 
@@ -125,22 +139,29 @@ _OFZ_CACHE_TTL = 1800
 # Версия формата/расчёта кэша. Меняется, когда меняется логика подбора —
 # тогда старый кэш с диска игнорируется и пересчитывается.
 _OFZ_CACHE_VERSION = 2
-_OFZ_CACHE = {"data": None, "ts": 0}
+# Неполный результат (часть бумаг пропущена из-за ошибок API) держим только в памяти
+# и недолго — чтобы не показывать его полчаса, но и не долбить API при каждом нажатии
+_OFZ_PARTIAL_TTL = 300
+_OFZ_CACHE = {"data": None, "ts": 0, "partial": False}
+# Лок: повторные нажатия после таймаута не запускают параллельные пересчёты
+_OFZ_LOCK = threading.Lock()
 
 
 def _load_ofz_cache_from_disk():
+    """(data, ts) из файла кэша или (None, 0), если кэша нет / он устарел."""
     if not os.path.exists(_OFZ_CACHE_FILE):
-        return None
+        return None, 0
     try:
         with open(_OFZ_CACHE_FILE, "r", encoding="utf-8") as f:
             cached = json.load(f)
         if cached.get("version") != _OFZ_CACHE_VERSION:
-            return None
-        if time.time() - cached.get("ts", 0) < _OFZ_CACHE_TTL:
-            return cached.get("data")
+            return None, 0
+        ts = cached.get("ts", 0)
+        if time.time() - ts < _OFZ_CACHE_TTL:
+            return cached.get("data"), ts
     except Exception:
-        pass
-    return None
+        logging.exception("Не удалось прочитать кэш ОФЗ")
+    return None, 0
 
 
 def _save_ofz_cache_to_disk(data):
@@ -180,17 +201,57 @@ def _ytm_from_flows(dirty_price, flows, now):
     return (low + high) / 2 * 100
 
 
-def _calc_ofz_ytm(client, bond, price_rub):
-    try:
-        now = datetime.now(timezone.utc)
-        maturity = bond.maturity_date
-        years = (maturity - now).days / 365.25
-        if years < 1.0:
-            return None
+# Временные ошибки API, при которых имеет смысл повторить запрос
+_RETRYABLE_CODES = {"RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE_EXCEEDED"}
+_MAX_RETRY_DELAY = 30.0
 
-        coupons = client.instruments.get_bond_coupons(
-            figi=bond.figi, from_=now, to=maturity,
-        ).events
+
+def _is_retryable(e):
+    code = getattr(e, "code", None)
+    return getattr(code, "name", str(code)) in _RETRYABLE_CODES
+
+
+def _retry_delay(e, attempt, base_delay):
+    """Пауза перед повтором: ratelimit_reset из ответа API, иначе backoff 1, 2, 4 с."""
+    reset = getattr(getattr(e, "metadata", None), "ratelimit_reset", None)
+    if isinstance(reset, (int, float)) and reset > 0:
+        return min(float(reset), _MAX_RETRY_DELAY)
+    return base_delay * 2 ** attempt
+
+
+def _call_with_retry(func, attempts=4, base_delay=1.0, **kwargs):
+    """Вызов API с ретраями только при временных ошибках.
+
+    Повторяем RESOURCE_EXHAUSTED / UNAVAILABLE / DEADLINE_EXCEEDED
+    (пауза — ratelimit_reset или 1, 2, 4 с). Остальные ошибки
+    (NOT_FOUND, INVALID_ARGUMENT, UNAUTHENTICATED…) и последняя
+    неудачная попытка пробрасываются сразу, без пауз.
+    """
+    for attempt in range(attempts):
+        try:
+            return func(**kwargs)
+        except RequestError as e:
+            if not _is_retryable(e) or attempt == attempts - 1:
+                raise
+            delay = _retry_delay(e, attempt, base_delay)
+            logging.warning("Ошибка API (%s), повтор через %.0f с", e.code, delay)
+            time.sleep(delay)
+
+
+def _calc_ofz_ytm(client, bond, price_rub):
+    now = datetime.now(timezone.utc)
+    maturity = bond.maturity_date
+    years = (maturity - now).days / 365.25
+    if years < 1.0:
+        return None
+
+    # Ошибки API не глушим: вызывающий должен знать, что результат неполный
+    coupons = _call_with_retry(
+        client.instruments.get_bond_coupons,
+        figi=bond.figi, from_=now, to=maturity,
+    ).events
+
+    try:
         if not coupons or bond.coupon_quantity_per_year == 0:
             return None
 
@@ -225,22 +286,43 @@ def _calc_ofz_ytm(client, bond, price_rub):
             "aci": round(aci, 2),
         }
     except Exception:
+        logging.exception("Ошибка расчёта YTM для %s", bond.ticker)
         return None
 
 
-def get_top_ofz(limit=5, use_cache=True, debug=False):
-    """Топ-N ОФЗ по YTM со всей биржи."""
-    if use_cache and _OFZ_CACHE["data"] is not None:
-        if time.time() - _OFZ_CACHE["ts"] < _OFZ_CACHE_TTL:
+def _get_ofz_cached(limit):
+    """Топ из кэша (память, затем диск) или None, если кэша нет / он устарел."""
+    if _OFZ_CACHE["data"] is not None:
+        ttl = _OFZ_PARTIAL_TTL if _OFZ_CACHE["partial"] else _OFZ_CACHE_TTL
+        if time.time() - _OFZ_CACHE["ts"] < ttl:
             return _OFZ_CACHE["data"][:limit]
 
-    if use_cache:
-        disk_data = _load_ofz_cache_from_disk()
-        if disk_data:
-            _OFZ_CACHE["data"] = disk_data
-            _OFZ_CACHE["ts"] = time.time()
-            return disk_data[:limit]
+    disk_data, disk_ts = _load_ofz_cache_from_disk()
+    if disk_data:
+        _OFZ_CACHE["data"] = disk_data
+        _OFZ_CACHE["ts"] = disk_ts
+        _OFZ_CACHE["partial"] = False
+        return disk_data[:limit]
+    return None
 
+
+def get_top_ofz(limit=5, use_cache=True):
+    """Топ-N ОФЗ по YTM со всей биржи."""
+    if use_cache:
+        cached = _get_ofz_cached(limit)
+        if cached is not None:
+            return cached
+
+    with _OFZ_LOCK:
+        # Пока ждали лок, другой поток мог уже посчитать и закэшировать результат
+        if use_cache:
+            cached = _get_ofz_cached(limit)
+            if cached is not None:
+                return cached
+        return _compute_top_ofz(limit)
+
+
+def _compute_top_ofz(limit):
     with Client(TOKEN) as client:
         all_bonds = client.instruments.bonds().instruments
         # Только ОФЗ с постоянным купоном и без амортизации: у плавающих (29xxx)
@@ -258,6 +340,7 @@ def get_top_ofz(limit=5, use_cache=True, debug=False):
         figi_to_raw = {p.figi: money_to_float(p.price) for p in prices_resp}
 
         results = []
+        failed = 0
         for b in ofz:
             raw = figi_to_raw.get(b.figi, 0)
             if raw <= 0:
@@ -267,7 +350,12 @@ def get_top_ofz(limit=5, use_cache=True, debug=False):
             # Цена облигации в API всегда в % от номинала
             price_rub = raw / 100 * nominal
 
-            info = _calc_ofz_ytm(client, b, price_rub)
+            try:
+                info = _calc_ofz_ytm(client, b, price_rub)
+            except RequestError:
+                failed += 1
+                logging.exception("Не удалось получить купоны %s", b.ticker)
+                continue
             if info:
                 results.append(info)
 
@@ -275,9 +363,20 @@ def get_top_ofz(limit=5, use_cache=True, debug=False):
 
         results.sort(key=lambda x: x["ytm"], reverse=True)
 
-        _OFZ_CACHE["data"] = results
-        _OFZ_CACHE["ts"] = time.time()
-        _save_ofz_cache_to_disk(results)
+        # Полностью пустой результат не кэшируем. Неполный (были ошибки API)
+        # — только в памяти и с коротким TTL, на диск не пишем
+        if results:
+            _OFZ_CACHE["data"] = results
+            _OFZ_CACHE["ts"] = time.time()
+            _OFZ_CACHE["partial"] = bool(failed)
+            if failed:
+                logging.warning(
+                    "ОФЗ: %d бумаг пропущено из-за ошибок API, результат кэширован на %d с",
+                    failed, _OFZ_PARTIAL_TTL)
+            else:
+                _save_ofz_cache_to_disk(results)
+        elif failed:
+            logging.warning("ОФЗ: %d бумаг пропущено из-за ошибок API, кэш не обновлён", failed)
 
         return results[:limit]
 
@@ -302,7 +401,18 @@ def get_portfolio_snapshot():
 
         by_figi, _ = _build_shares_index(client)
 
+        # Курсы валют к рублю из валютных позиций портфеля (USD000UTSTOM → usd):
+        # цена не-рублёвых бумаг в API приходит в валюте инструмента
+        fx_rates = {}
+        for pos in portfolio.positions:
+            if pos.instrument_type == "currency" and pos.current_price.currency == "rub":
+                fx_rates[pos.ticker[:3].lower()] = money_to_float(pos.current_price)
+
         positions = []
+        # Стоимость бумаг, которые не входят ни в одну категорию (игнорируемые
+        # тикеры, ETF кроме AKGD и т.п.): вычитаем из итога, чтобы доли
+        # категорий считались от суммы, которая реально в них распределена
+        excluded_value = 0.0
         # Рубли на счёте приходят в портфеле отдельной позицией RUB000UTSTOM
         # и уже входят в total_amount_portfolio. Запоминаем их, чтобы не
         # прибавить свободные деньги к итогу второй раз.
@@ -311,15 +421,36 @@ def get_portfolio_snapshot():
             ticker = pos.ticker
             if ticker == "RUB000UTSTOM":
                 rub_in_portfolio += money_to_float(pos.quantity) * money_to_float(pos.current_price)
+
+            # Цена в валюте инструмента → рубли
+            price = money_to_float(pos.current_price)
+            cur = pos.current_price.currency
+            if cur and cur != "rub":
+                rate = fx_rates.get(cur)
+                if rate:
+                    price *= rate
+                else:
+                    logging.warning("Нет курса %s/rub для %s, цена не пересчитана", cur, ticker)
+
+            # НКД — в своей валюте (обычно совпадает с валютой цены) → рубли
+            nkd = money_to_float(pos.current_nkd) if pos.current_nkd else 0.0
+            nkd_cur = pos.current_nkd.currency if pos.current_nkd else None
+            if nkd and nkd_cur and nkd_cur != "rub":
+                nkd_rate = fx_rates.get(nkd_cur)
+                if nkd_rate:
+                    nkd *= nkd_rate
+                else:
+                    logging.warning("Нет курса %s/rub для НКД %s, НКД не пересчитан", nkd_cur, ticker)
+
             if ticker in IGNORED_TICKERS:
+                if ticker != "RUB000UTSTOM":
+                    excluded_value += money_to_float(pos.quantity) * (price + nkd)
                 continue
 
             # quantity — Quotation (units + nano): nano нужен для дробных
             # количеств, например валюты (150.75 USD), иначе дробь терялась
             qty = money_to_float(pos.quantity)
-            price = money_to_float(pos.current_price)
-            # НКД (накопленный купонный доход) — часть стоимости облигации
-            nkd = money_to_float(pos.current_nkd) if pos.current_nkd else 0.0
+            # НКД (накопленный купонный доход, уже в рублях) — часть стоимости облигации
             value = qty * (price + nkd)
 
             inst_type = pos.instrument_type
@@ -350,8 +481,13 @@ def get_portfolio_snapshot():
                 "nkd": nkd,
             })
 
+        for p in positions:
+            if not (p["type"] in ("share", "bond", "currency")
+                    or (p["type"] == "etf" and p["ticker"] == "AKGD")):
+                excluded_value += p["value"]
+
         # total_value — портфель БЕЗ свободных рублей, total_with_cash — с ними
-        total_value = money_to_float(portfolio.total_amount_portfolio) - rub_in_portfolio
+        total_value = money_to_float(portfolio.total_amount_portfolio) - rub_in_portfolio - excluded_value
         total_with_cash = total_value + free_cash_rub
 
         categories = {"Акции": 0.0, "Облигации": 0.0, "Золото": 0.0, "Валюта": 0.0}

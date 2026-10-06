@@ -37,7 +37,7 @@ def find_position(snapshot, ticker):
     return next((p for p in snapshot["positions"] if p["ticker"] == ticker), None)
 
 
-def calc_qty(gap, lot_price, budget, max_overshoot=1.0):
+def calc_qty(gap, lot_price, budget):
     """Сколько лотов купить.
 
     Ключевое правило: если gap > 0 и хватает денег на лот — покупаем хотя бы 1.
