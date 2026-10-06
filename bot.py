@@ -22,6 +22,8 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
+from t_tech.invest.exceptions import RequestError
+
 from tinkoff_api import get_portfolio_snapshot
 from recommender import TARGETS, recommend
 from ai_advisor import analyze_portfolio, is_enabled
@@ -166,6 +168,20 @@ async def _safe_edit(message, text, **kwargs):
             raise
 
 
+def _err_text(e):
+    """Текст ошибки для пользователя: у RequestError str(e) часто пустой."""
+    if isinstance(e, RequestError):
+        parts = [getattr(e.code, "name", str(e.code))]
+        details = getattr(e, "details", None)
+        if details:
+            parts.append(str(details))
+        message = getattr(getattr(e, "metadata", None), "message", None)
+        if message and message != details:
+            parts.append(str(message))
+        return ": ".join(parts)
+    return str(e) or type(e).__name__
+
+
 async def _with_timeout(func, timeout, *args, **kwargs):
     """asyncio.to_thread с таймаутом и понятным сообщением об ошибке."""
     try:
@@ -178,18 +194,34 @@ async def _get_snapshot():
     return await _with_timeout(get_portfolio_snapshot, SNAPSHOT_TIMEOUT)
 
 
+def _u16len(s):
+    """Длина строки в UTF-16 единицах — так Telegram считает лимит сообщения."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _cut_u16(line, limit):
+    """(голова, хвост): голова ≤ limit UTF-16 единиц, суррогатные пары не рвутся."""
+    used = 0
+    for i, ch in enumerate(line):
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > limit:
+            return line[:i], line[i:]
+        used += w
+    return line, ""
+
+
 def _split_message(text, limit=TG_MESSAGE_LIMIT):
-    """Режет текст на части ≤ limit символов по переводам строки."""
+    """Режет текст на части ≤ limit UTF-16 единиц по переводам строки."""
     chunks = []
     current = ""
     for line in text.split("\n"):
-        while len(line) > limit:  # одна очень длинная строка — режем жёстко
+        while _u16len(line) > limit:  # одна очень длинная строка — режем жёстко
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.append(line[:limit])
-            line = line[limit:]
-        if current and len(current) + 1 + len(line) > limit:
+            head, line = _cut_u16(line, limit)
+            chunks.append(head)
+        if current and _u16len(current) + 1 + _u16len(line) > limit:
             chunks.append(current)
             current = line
         else:
@@ -201,7 +233,7 @@ def _split_message(text, limit=TG_MESSAGE_LIMIT):
 
 async def _answer_long(message, text, reply_markup=None, **kwargs):
     """message.answer для длинных текстов: клавиатура — только на последней части."""
-    chunks = _split_message(text)
+    chunks = _split_message(text) or ["(пустой ответ)"]
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1
         await message.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
@@ -438,7 +470,7 @@ async def cmd_portfolio(message: Message):
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
-            f"⚠️ Не удалось получить портфель.\n\n<code>{html.escape(str(e))}</code>",
+            f"⚠️ Не удалось получить портфель.\n\n<code>{html.escape(_err_text(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -458,7 +490,7 @@ async def cmd_structure(message: Message):
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await message.answer(
-            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
+            f"⚠️ Ошибка: <code>{html.escape(_err_text(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -538,7 +570,7 @@ async def _send_plan(message: Message, override):
     except Exception as e:
         logging.exception("Ошибка при расчёте плана")
         await message.answer(
-            f"⚠️ Не удалось рассчитать план.\n\n<code>{html.escape(str(e))}</code>",
+            f"⚠️ Не удалось рассчитать план.\n\n<code>{html.escape(_err_text(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -614,7 +646,7 @@ async def cb_portfolio(callback: CallbackQuery):
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await _safe_edit(callback.message,
-            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
+            f"⚠️ Ошибка: <code>{html.escape(_err_text(e))}</code>",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
@@ -635,7 +667,7 @@ async def cb_structure(callback: CallbackQuery):
     except Exception as e:
         logging.exception("Ошибка Tinkoff API")
         await _safe_edit(callback.message,
-            f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>",
+            f"⚠️ Ошибка: <code>{html.escape(_err_text(e))}</code>",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
@@ -660,11 +692,15 @@ async def cb_analyze(callback: CallbackQuery):
         analysis = await _with_timeout(analyze_portfolio, AI_TIMEOUT, snapshot)
     except Exception as e:
         logging.exception("Ошибка AI-анализа")
-        await _safe_edit(callback.message,
-            f"⚠️ Ошибка AI-анализа: <code>{html.escape(str(e))}</code>",
-            parse_mode="HTML",
-            reply_markup=back_kb(),
-        )
+        text = f"⚠️ Ошибка AI-анализа: <code>{html.escape(_err_text(e))}</code>"
+        try:
+            await _safe_edit(callback.message, text, parse_mode="HTML", reply_markup=back_kb())
+        except Exception:
+            logging.exception("Не удалось показать ошибку правкой сообщения")
+            try:
+                await callback.message.answer(text, parse_mode="HTML", reply_markup=back_kb())
+            except Exception:
+                logging.exception("Не удалось отправить сообщение об ошибке")
         return
 
     # Ответ может не влезть в одно сообщение: первая часть — правкой, остальные — новыми

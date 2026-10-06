@@ -145,10 +145,17 @@ _OFZ_PARTIAL_TTL = 300
 _OFZ_CACHE = {"data": None, "ts": 0, "partial": False}
 # Лок: повторные нажатия после таймаута не запускают параллельные пересчёты
 _OFZ_LOCK = threading.Lock()
+# Сколько ждать лок, пока другой поток считает топ (сек)
+_OFZ_LOCK_TIMEOUT = 60
+# Общий дедлайн на обход облигаций в _compute_top_ofz (сек)
+_OFZ_COMPUTE_DEADLINE = 240
 
 
-def _load_ofz_cache_from_disk():
-    """(data, ts) из файла кэша или (None, 0), если кэша нет / он устарел."""
+def _load_ofz_cache_from_disk(max_age=_OFZ_CACHE_TTL):
+    """(data, ts) из файла кэша или (None, 0), если кэша нет / он устарел.
+
+    max_age=None — вернуть кэш любого возраста (запасной вариант при сбое пересчёта).
+    """
     if not os.path.exists(_OFZ_CACHE_FILE):
         return None, 0
     try:
@@ -157,7 +164,7 @@ def _load_ofz_cache_from_disk():
         if cached.get("version") != _OFZ_CACHE_VERSION:
             return None, 0
         ts = cached.get("ts", 0)
-        if time.time() - ts < _OFZ_CACHE_TTL:
+        if max_age is None or time.time() - ts < max_age:
             return cached.get("data"), ts
     except Exception:
         logging.exception("Не удалось прочитать кэш ОФЗ")
@@ -313,13 +320,31 @@ def get_top_ofz(limit=5, use_cache=True):
         if cached is not None:
             return cached
 
-    with _OFZ_LOCK:
+    if not _OFZ_LOCK.acquire(timeout=_OFZ_LOCK_TIMEOUT):
+        # Другой поток слишком долго считает: отдаём устаревший кэш, если он есть
+        stale = _get_ofz_stale(limit)
+        if stale:
+            logging.warning("Лок ОФЗ занят дольше %d с, возвращаю устаревший кэш", _OFZ_LOCK_TIMEOUT)
+            return stale
+        raise TimeoutError(
+            f"расчёт топа ОФЗ уже идёт дольше {_OFZ_LOCK_TIMEOUT} с, кэша нет — повторите позже")
+    try:
         # Пока ждали лок, другой поток мог уже посчитать и закэшировать результат
         if use_cache:
             cached = _get_ofz_cached(limit)
             if cached is not None:
                 return cached
         return _compute_top_ofz(limit)
+    finally:
+        _OFZ_LOCK.release()
+
+
+def _get_ofz_stale(limit):
+    """Кэш ОФЗ любого возраста (память, затем диск) или None."""
+    if _OFZ_CACHE["data"]:
+        return _OFZ_CACHE["data"][:limit]
+    disk_data, _ = _load_ofz_cache_from_disk(max_age=None)
+    return disk_data[:limit] if disk_data else None
 
 
 def _compute_top_ofz(limit):
@@ -341,7 +366,13 @@ def _compute_top_ofz(limit):
 
         results = []
         failed = 0
+        deadline = time.monotonic() + _OFZ_COMPUTE_DEADLINE
         for b in ofz:
+            if time.monotonic() > deadline:
+                # Результат неполный: partial (короткий TTL, без записи на диск)
+                failed += 1
+                logging.warning("ОФЗ: превышен дедлайн %d с, обход прерван", _OFZ_COMPUTE_DEADLINE)
+                break
             raw = figi_to_raw.get(b.figi, 0)
             if raw <= 0:
                 continue
@@ -381,6 +412,50 @@ def _compute_top_ofz(limit):
         return results[:limit]
 
 
+# ---------- Курсы валют (запасной источник) ----------
+
+_FX_TICKERS = {"usd": "USD000UTSTOM", "cny": "CNYRUB_TOM", "eur": "EUR_RUB__TOM"}
+_FX_CACHE_TTL = 600
+_FX_CACHE = {}  # {код валюты: (курс, ts)}
+
+
+def _get_fx_rates(client, codes):
+    """{код валюты: курс к рублю} для валют без позиции в портфеле.
+
+    Курс — последняя цена валютного инструмента (кэш 10 минут).
+    При ошибке возвращает то, что удалось получить, без исключений.
+    """
+    result = {}
+    missing = []
+    now = time.time()
+    for code in codes:
+        cached = _FX_CACHE.get(code)
+        if cached and now - cached[1] < _FX_CACHE_TTL:
+            result[code] = cached[0]
+        elif code in _FX_TICKERS:
+            missing.append(code)
+    if not missing:
+        return result
+
+    try:
+        figi_to_code = {}
+        for c in client.instruments.currencies().instruments:
+            for code in missing:
+                if code not in figi_to_code.values() and c.ticker.startswith(_FX_TICKERS[code]):
+                    figi_to_code[c.figi] = code
+        if figi_to_code:
+            prices = client.market_data.get_last_prices(figi=list(figi_to_code)).last_prices
+            for p in prices:
+                code = figi_to_code.get(p.figi)
+                rate = money_to_float(p.price)
+                if code and rate > 0:
+                    result[code] = rate
+                    _FX_CACHE[code] = (rate, time.time())
+    except Exception:
+        logging.warning("Не удалось получить курсы валют %s через API", missing, exc_info=True)
+    return result
+
+
 # ---------- Снимок портфеля ----------
 
 def get_portfolio_snapshot():
@@ -407,6 +482,15 @@ def get_portfolio_snapshot():
         for pos in portfolio.positions:
             if pos.instrument_type == "currency" and pos.current_price.currency == "rub":
                 fx_rates[pos.ticker[:3].lower()] = money_to_float(pos.current_price)
+
+        # Валюты, в которых номинированы бумаги/НКД, но которых нет в позициях
+        needed = set()
+        for pos in portfolio.positions:
+            for m in (pos.current_price, pos.current_nkd):
+                if m and m.currency and m.currency != "rub" and m.currency not in fx_rates:
+                    needed.add(m.currency)
+        if needed:
+            fx_rates.update(_get_fx_rates(client, needed))
 
         positions = []
         # Стоимость бумаг, которые не входят ни в одну категорию (игнорируемые
