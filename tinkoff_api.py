@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from t_tech.invest import Client
@@ -138,7 +138,7 @@ _OFZ_CACHE_FILE = "ofz_cache.json"
 _OFZ_CACHE_TTL = 1800
 # Версия формата/расчёта кэша. Меняется, когда меняется логика подбора —
 # тогда старый кэш с диска игнорируется и пересчитывается.
-_OFZ_CACHE_VERSION = 2
+_OFZ_CACHE_VERSION = 3
 # Неполный результат (часть бумаг пропущена из-за ошибок API) держим только в памяти
 # и недолго — чтобы не показывать его полчаса, но и не долбить API при каждом нажатии
 _OFZ_PARTIAL_TTL = 300
@@ -250,6 +250,30 @@ def _call_with_retry(func, attempts=4, base_delay=1.0, deadline=None, **kwargs):
             time.sleep(delay)
 
 
+# Москва живёт по UTC+3 без перехода на летнее время. Фиксированный сдвиг
+# не требует пакета tzdata в Docker-образе (в отличие от ZoneInfo)
+_MSK = timezone(timedelta(hours=3))
+
+
+def _buyer_gets_coupon(coupon, today_msk):
+    """Получит ли этот купон тот, кто покупает облигацию сегодня.
+
+    Купон платят тем, кто числится владельцем на дату фиксации реестра
+    (fix_date, обычно за день до выплаты). Сделка на бирже проходит на
+    следующий рабочий день (T+1), поэтому купившему сегодня купон достанется,
+    только если фиксация позже сегодняшнего дня. В день фиксации бумага уже
+    торгуется «без купона»: НКД обнулён, а сам купон уйдёт прежнему владельцу.
+    Раньше такой купон считался доходом покупателя, и раз в полгода, в день
+    фиксации, доходность бумаги завышалась на ~1,7 п.п. (26245: 18,5 % вместо 16,8 %).
+    """
+    fix_date = coupon.fix_date
+    # Если дата фиксации не задана, API отдаёт «нулевую» дату (1970 год).
+    # Тогда приближение: день до выплаты (без учёта выходных; у ОФЗ дата обычно есть)
+    if fix_date is None or fix_date.year <= 1970:
+        fix_date = coupon.coupon_date - timedelta(days=1)
+    return fix_date.astimezone(_MSK).date() > today_msk
+
+
 def _calc_ofz_ytm(client, bond, price_rub, deadline=None):
     now = datetime.now(timezone.utc)
     maturity = bond.maturity_date
@@ -264,6 +288,9 @@ def _calc_ofz_ytm(client, bond, price_rub, deadline=None):
     ).events
 
     try:
+        # Только купоны, которые достанутся покупателю (без уже зафиксированного)
+        today_msk = now.astimezone(_MSK).date()
+        coupons = [c for c in coupons if _buyer_gets_coupon(c, today_msk)]
         if not coupons or bond.coupon_quantity_per_year == 0:
             return None
 
